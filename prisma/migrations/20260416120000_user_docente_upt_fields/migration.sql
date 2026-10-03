@@ -1,0 +1,5 @@
+ALTER TABLE "User"
+ADD COLUMN "pnf" TEXT,
+ADD COLUMN "periodoAcademico" TEXT,
+ADD COLUMN "tramo" TEXT,
+ADD COLUMN "sede" TEXT;

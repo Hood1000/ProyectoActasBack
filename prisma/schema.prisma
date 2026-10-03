@@ -1,0 +1,314 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  name         String
+  cedula       String?       @unique
+  pnf          String?
+  periodoAcademico String?
+  tramo        String?
+  sede         String?
+  phoneNumber  String?
+  password     String
+  isActive     Boolean       @default(true)
+  role         Role          @default(DOCENTE)
+  dedicacion   Dedicacion?
+  escalafon    Escalafon?
+  condicion    Condicion?
+  meetings     Meeting[]     @relation("Organizer")
+  cancelledMeetings Meeting[] @relation("MeetingCanceller")
+  attendance   Attendance[]
+  tasks        ActionItem[]
+  agendaPoints AgendaPoint[] @relation("AgendaProposer")
+  chatMessages ChatMessage[]
+  pollVotes    PollVote[]
+  pollsCreated Poll[]        @relation("PollCreator")
+  absenceAlerts AbsenceAlert[] @relation("TeacherAbsenceAlerts")
+  reviewedAbsenceAlerts AbsenceAlert[] @relation("AbsenceAlertReviewer")
+  notificationRecipients NotificationRecipient[]
+}
+
+model Meeting {
+  id                    String       @id @default(uuid())
+  title                 String
+  description           String?
+  date                  DateTime
+  location              String
+  meetingType           MeetingType  @default(ORDINARIA)
+  meetingCategory       MeetingCategory @default(CONSEJO_CARRERA)
+  modality              MeetingMode
+  quorumMinimo          Int          @default(0)
+  hasQuorum             Boolean      @default(false)
+  attendanceOpensAt     DateTime?
+  attendanceClosesAt    DateTime?
+  attendanceFinalized   Boolean      @default(false)
+  attendanceFinalizedAt DateTime?
+  agendaConsolidated    Boolean      @default(false)
+  evidenceSignaturesUrl String?
+  isClosed              Boolean      @default(false)
+  closedAt              DateTime?
+  finalSummary          String?
+  status                Status       @default(PROGRAMADA)
+  cancellationReason    String?
+  cancelledAt           DateTime?
+  cancelledBy           User?        @relation("MeetingCanceller", fields: [cancelledById], references: [id])
+  cancelledById         String?
+  organizer             User         @relation("Organizer", fields: [organizerId], references: [id])
+  organizerId           String
+  minute                Minute?
+  attendance            Attendance[]
+  actionItems           ActionItem[]
+  agendaPoints          AgendaPoint[]
+  chatMessages          ChatMessage[]
+  polls                 Poll[]
+  absenceAlerts         AbsenceAlert[]
+
+  @@index([status, date])
+}
+
+model AbsenceAlert {
+  id             String   @id @default(uuid())
+  teacher        User     @relation("TeacherAbsenceAlerts", fields: [teacherId], references: [id])
+  teacherId      String
+  meeting        Meeting? @relation(fields: [meetingId], references: [id])
+  meetingId      String?
+  academicYear   Int
+  threshold      Int      @default(3)
+  absencesCount  Int
+  summary        String
+  notifiedAt     DateTime @default(now())
+  reviewStatus   AbsenceAlertReviewStatus @default(PENDIENTE)
+  reviewNotes    String?
+  reviewedAt     DateTime?
+  reviewedBy     User?    @relation("AbsenceAlertReviewer", fields: [reviewedById], references: [id])
+  reviewedById   String?
+  notifications  SystemNotification[]
+
+  @@unique([teacherId, academicYear, threshold])
+  @@index([teacherId, academicYear])
+  @@index([notifiedAt])
+  @@index([reviewStatus, notifiedAt])
+}
+
+model SystemNotification {
+  id             String   @id @default(uuid())
+  type           NotificationType
+  title          String
+  message        String
+  actionHref     String?
+  absenceAlert   AbsenceAlert? @relation(fields: [absenceAlertId], references: [id])
+  absenceAlertId String?
+  createdAt      DateTime @default(now())
+  recipients     NotificationRecipient[]
+
+  @@index([type, createdAt])
+  @@index([absenceAlertId])
+}
+
+model NotificationRecipient {
+  id             String   @id @default(uuid())
+  notification   SystemNotification @relation(fields: [notificationId], references: [id])
+  notificationId String
+  user           User     @relation(fields: [userId], references: [id])
+  userId         String
+  readAt         DateTime?
+  dismissedAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  @@unique([notificationId, userId])
+  @@index([userId, readAt])
+  @@index([userId, dismissedAt])
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  meeting   Meeting  @relation(fields: [meetingId], references: [id])
+  meetingId String
+  author    User     @relation(fields: [authorId], references: [id])
+  authorId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([meetingId, createdAt])
+}
+
+model Poll {
+  id          String      @id @default(uuid())
+  meeting     Meeting     @relation(fields: [meetingId], references: [id])
+  meetingId   String
+  question    String
+  status      PollStatus  @default(OPEN)
+  createdById String
+  createdBy   User        @relation("PollCreator", fields: [createdById], references: [id])
+  createdAt   DateTime    @default(now())
+  closedAt    DateTime?
+  votes       PollVote[]
+
+  @@index([meetingId, createdAt])
+}
+
+model PollVote {
+  id         String      @id @default(uuid())
+  poll       Poll        @relation(fields: [pollId], references: [id])
+  pollId     String
+  voter      User        @relation(fields: [voterId], references: [id])
+  voterId    String
+  option     PollOption
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@unique([pollId, voterId])
+}
+
+model AgendaPoint {
+  id          String       @id @default(uuid())
+  title       String
+  description String
+  status      AgendaStatus @default(PENDIENTE)
+  isBasePoint Boolean      @default(false)
+  meeting     Meeting      @relation(fields: [meetingId], references: [id])
+  meetingId   String
+  proposer    User?        @relation("AgendaProposer", fields: [proposerId], references: [id])
+  proposerId  String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([meetingId, status])
+  @@index([proposerId, meetingId])
+}
+
+model Minute {
+  id        String   @id @default(uuid())
+  content   String   @db.Text
+  meeting   Meeting  @relation(fields: [meetingId], references: [id])
+  meetingId String   @unique
+  createdAt DateTime @default(now())
+}
+
+model ActionItem {
+  id            String    @id @default(uuid())
+  description   String
+  deadline      DateTime?
+  completed     Boolean   @default(false)
+  responsible   User      @relation(fields: [responsibleId], references: [id])
+  responsibleId String
+  meeting       Meeting   @relation(fields: [meetingId], references: [id])
+  meetingId     String
+
+  @@index([meetingId])
+  @@index([responsibleId])
+}
+
+model Attendance {
+  id          String        @id @default(uuid())
+  user        User          @relation(fields: [userId], references: [id])
+  userId      String
+  meeting     Meeting       @relation(fields: [meetingId], references: [id])
+  meetingId   String
+  status      AttendanceStatus @default(PENDIENTE)
+  markedAt    DateTime?
+  excuse      String?
+  createdAt   DateTime      @default(now())
+
+  @@unique([userId, meetingId])
+  @@index([meetingId, status])
+  @@index([userId, status])
+}
+
+enum AbsenceAlertReviewStatus {
+  PENDIENTE
+  REVISADA
+  DESCARTADA
+}
+
+enum AttendanceStatus {
+  PENDIENTE
+  PRESENTE
+  AUSENTE
+  JUSTIFICADA
+}
+
+enum Role {
+  ADMIN
+  SECRETARIO
+  DOCENTE
+}
+
+enum Status {
+  PROGRAMADA
+  EN_CURSO
+  FINALIZADA
+  CANCELADA
+}
+
+enum MeetingType {
+  ORDINARIA
+  EXTRAORDINARIA
+}
+
+enum MeetingCategory {
+  CONSEJO_CARRERA
+  CID_PEDAGOGICO
+  ASAMBLEA
+}
+
+enum MeetingMode {
+  PRESENCIAL
+  VIRTUAL
+  HIBRIDA
+}
+
+enum AgendaStatus {
+  PENDIENTE
+  APROBADO
+  RECHAZADO
+}
+
+enum Dedicacion {
+  EXCLUSIVA
+  TIEMPO_COMPLETO
+  MEDIO_TIEMPO
+  TIEMPO_CONVENCIONAL
+}
+
+enum Escalafon {
+  INSTRUCTOR
+  ASISTENTE
+  AGREGADO
+  TITULAR
+}
+
+enum Condicion {
+  ORDINARIO
+  CONTRATADO
+  INTERINO
+}
+
+enum PollStatus {
+  OPEN
+  CLOSED
+}
+
+enum PollOption {
+  A_FAVOR
+  EN_CONTRA
+  ABSTENCION
+}
+
+enum NotificationType {
+  ABSENCE_ALERT
+}
