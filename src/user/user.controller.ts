@@ -6,6 +6,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UpdateUserAdminDto } from './dto/update-user-admin.dto';
+import { FindUsersQueryDto } from './dto/find-users-query.dto';
 
 @Controller('users')
 export class UserController {
@@ -29,8 +30,8 @@ export class UserController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN', 'SECRETARIO')
   @Get()
-  getUsers(@Query('role') role?: string) {
-    return this.userService.findAll(role);
+  getUsers(@Query() query: FindUsersQueryDto) {
+    return this.userService.findAll(query);
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)

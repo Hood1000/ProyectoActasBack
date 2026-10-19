@@ -1,9 +1,17 @@
 import { ForbiddenException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import type { Prisma, Role, User } from '../../generated/prisma';
+import type { Condicion, Dedicacion, Prisma, Role, User } from '../../generated/prisma';
 import prisma from '../prismaClient';
 import * as bcrypt from 'bcryptjs';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UpdateUserAdminDto } from './dto/update-user-admin.dto';
+
+interface FindUsersFilters {
+  search?: string;
+  role?: Role;
+  dedicacion?: Dedicacion;
+  condicion?: Condicion;
+  isActive?: boolean;
+}
 
 @Injectable()
 export class UserService implements OnModuleInit, OnModuleDestroy {
@@ -44,12 +52,25 @@ export class UserService implements OnModuleInit, OnModuleDestroy {
     return prisma.user.findUnique({ where: { id }, select: this.publicUserSelect });
   }
 
-  async findAll(role?: string) {
-    if (!role) {
-      return prisma.user.findMany({ select: this.publicUserSelect });
+  async findAll(filters: FindUsersFilters = {}) {
+    const { search, role, dedicacion, condicion, isActive } = filters;
+    const where: Prisma.UserWhereInput = {};
+
+    if (role) where.role = role;
+    if (dedicacion) where.dedicacion = dedicacion;
+    if (condicion) where.condicion = condicion;
+    if (typeof isActive === 'boolean') where.isActive = isActive;
+
+    if (search && search.trim()) {
+      const term = search.trim();
+      where.OR = [
+        { name: { contains: term, mode: 'insensitive' } },
+        { email: { contains: term, mode: 'insensitive' } },
+        { cedula: { contains: term, mode: 'insensitive' } },
+      ];
     }
 
-    return prisma.user.findMany({ where: { role: role as Role }, select: this.publicUserSelect });
+    return prisma.user.findMany({ where, select: this.publicUserSelect });
   }
 
   async updateOwnProfile(authUserId: string, dto: UpdateProfileDto) {
