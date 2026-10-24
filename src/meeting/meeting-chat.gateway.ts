@@ -1,0 +1,92 @@
+import { Logger } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+import { MeetingService } from './meeting.service';
+
+type SocketUser = { id: string; email: string; role: string };
+
+const meetingRoom = (meetingId: string) => `meeting:${meetingId}`;
+
+// Mismo criterio que enableCors en main.ts; se evalua en runtime porque el decorador
+// se ejecuta antes de que dotenv cargue las variables.
+const corsOrigin = (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+  const configuredOrigins = process.env.CORS_ORIGINS?.split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+
+  if (!configuredOrigins || configuredOrigins.length === 0 || !origin) {
+    return callback(null, true);
+  }
+  callback(null, configuredOrigins.includes(origin));
+};
+
+@WebSocketGateway({
+  cors: { origin: corsOrigin, credentials: true },
+  connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 },
+})
+export class MeetingChatGateway implements OnGatewayConnection {
+  private readonly logger = new Logger(MeetingChatGateway.name);
+
+  @WebSocketServer()
+  server: Server;
+
+  constructor(
+    private readonly jwtService: JwtService,
+    private readonly meetingService: MeetingService,
+  ) {}
+
+  handleConnection(client: Socket) {
+    // Sesion recuperada por connectionStateRecovery: conserva data y salas.
+    if (client.recovered && client.data.user) return;
+
+    const token = client.handshake.auth?.token;
+    try {
+      const payload = this.jwtService.verify<{ sub: string; email: string; role: string }>(token);
+      client.data.user = { id: payload.sub, email: payload.email, role: payload.role } satisfies SocketUser;
+    } catch {
+      client.disconnect(true);
+    }
+  }
+
+  @SubscribeMessage('meeting:join')
+  async joinMeeting(@ConnectedSocket() client: Socket, @MessageBody() body: { meetingId?: string }) {
+    const user = client.data.user as SocketUser | undefined;
+    const meetingId = body?.meetingId;
+    if (!user || !meetingId) {
+      return { ok: false, error: 'Solicitud invalida' };
+    }
+
+    try {
+      await this.meetingService.ensureUserCanAccessMeetingContext(meetingId, user.id, user.role);
+      await client.join(meetingRoom(meetingId));
+      return { ok: true };
+    } catch (error) {
+      this.logger.debug(`join rechazado ${meetingId} (${user.id}): ${(error as Error).message}`);
+      return { ok: false, error: (error as Error).message };
+    }
+  }
+
+  @SubscribeMessage('meeting:leave')
+  async leaveMeeting(@ConnectedSocket() client: Socket, @MessageBody() body: { meetingId?: string }) {
+    if (body?.meetingId) {
+      await client.leave(meetingRoom(body.meetingId));
+    }
+    return { ok: true };
+  }
+
+  emitChatMessage(meetingId: string, message: unknown) {
+    this.server?.to(meetingRoom(meetingId)).emit('chat:new', message);
+  }
+
+  emitPollUpdate(meetingId: string, poll: unknown) {
+    this.server?.to(meetingRoom(meetingId)).emit('poll:update', poll);
+  }
+}

@@ -93,6 +93,8 @@ type AnnualArchivePayload = {
 @Injectable()
 export class MeetingService {
   private static readonly MAX_POINTS_PER_USER = 2;
+  private static readonly AUTO_CANCEL_REASON =
+    'La reunión no se realizó en la fecha programada y fue cancelada automáticamente por el sistema.';
   private static readonly ABSENCE_ALERT_THRESHOLD = 3;
   private static readonly AGENDA_PROPOSAL_HOURS_BEFORE_MEETING = 24;
   private static readonly TZ = process.env.APP_TIMEZONE || 'America/Caracas';
@@ -1153,9 +1155,14 @@ export class MeetingService {
       throw new BadRequestException('La asistencia de esta reunion no esta configurada');
     }
 
-    const now = new Date();
-    if (now < meeting.attendanceOpensAt || now > meeting.attendanceClosesAt) {
-      throw new BadRequestException('La ventana de asistencia no esta activa');
+    if (meeting.status === Status.CANCELADA) {
+      throw new BadRequestException('La reunion fue cancelada');
+    }
+
+    // Secretaria puede registrar o corregir asistencia (llegadas tarde, justificativos)
+    // desde que abre la ventana hasta que la reunion se cierra.
+    if (new Date() < meeting.attendanceOpensAt) {
+      throw new BadRequestException('La ventana de asistencia aun no se ha abierto');
     }
 
     await prisma.attendance.upsert({
@@ -1440,6 +1447,37 @@ export class MeetingService {
     });
 
     return this.mapMeetingView(closed);
+  }
+
+  private dayKeyInInstitutionalZone(date: Date): string {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: MeetingService.TZ }).format(date);
+  }
+
+  // Reuniones que siguen programadas aunque su dia ya paso (p. ej. el servidor estuvo apagado).
+  async autoCancelExpiredMeetings() {
+    const now = new Date();
+    const todayKey = this.dayKeyInInstitutionalZone(now);
+
+    const candidates = await prisma.meeting.findMany({
+      where: { isClosed: false, status: Status.PROGRAMADA, date: { lt: now } },
+      select: { id: true, date: true },
+    });
+
+    const expired = candidates.filter((meeting) => this.dayKeyInInstitutionalZone(meeting.date) < todayKey);
+    if (expired.length === 0) {
+      return { cancelledMeetings: 0 };
+    }
+
+    const result = await prisma.meeting.updateMany({
+      where: { id: { in: expired.map((meeting) => meeting.id) } },
+      data: {
+        status: Status.CANCELADA,
+        cancellationReason: MeetingService.AUTO_CANCEL_REASON,
+        cancelledAt: now,
+      },
+    });
+
+    return { cancelledMeetings: result.count };
   }
 
   async syncAttendanceWindows() {
@@ -1809,16 +1847,35 @@ export class MeetingService {
   }
 
   async remove(id: string) {
-    return prisma.meeting.delete({ where: { id } });
+    const meeting = await this.getMeetingOrThrow(id);
+
+    if (meeting.isClosed || meeting.status === Status.FINALIZADA) {
+      throw new BadRequestException('Una reunion finalizada forma parte del historial y no se puede eliminar');
+    }
+
+    return prisma.$transaction(async (tx) => {
+      await tx.pollVote.deleteMany({ where: { poll: { meetingId: id } } });
+      await tx.poll.deleteMany({ where: { meetingId: id } });
+      await tx.chatMessage.deleteMany({ where: { meetingId: id } });
+      await tx.agendaPoint.deleteMany({ where: { meetingId: id } });
+      await tx.attendance.deleteMany({ where: { meetingId: id } });
+      await tx.actionItem.deleteMany({ where: { meetingId: id } });
+      await tx.minute.deleteMany({ where: { meetingId: id } });
+      await tx.absenceAlert.updateMany({ where: { meetingId: id }, data: { meetingId: null } });
+      return tx.meeting.delete({ where: { id } });
+    });
   }
 
-  private async ensureUserCanAccessMeetingContext(meetingId: string, userId: string, userRole: string) {
+  async ensureUserCanAccessMeetingContext(meetingId: string, userId: string, userRole: string) {
     const meeting = await prisma.meeting.findUnique({
       where: { id: meetingId },
       select: {
         id: true,
         organizerId: true,
-        attendance: { select: { userId: true } },
+        status: true,
+        isClosed: true,
+        hasQuorum: true,
+        attendance: { select: { userId: true, status: true } },
       },
     });
 
@@ -1838,11 +1895,16 @@ export class MeetingService {
     return meeting;
   }
 
-  async listMeetingChatMessages(meetingId: string, userId: string, userRole: string) {
+  async listMeetingChatMessages(meetingId: string, userId: string, userRole: string, after?: string) {
     await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
 
+    const afterDate = after ? new Date(after) : null;
+    if (afterDate && Number.isNaN(afterDate.getTime())) {
+      throw new BadRequestException('Parametro after invalido');
+    }
+
     return prisma.chatMessage.findMany({
-      where: { meetingId },
+      where: { meetingId, ...(afterDate && { createdAt: { gt: afterDate } }) },
       include: {
         author: {
           select: { id: true, name: true, role: true, email: true },
@@ -1853,7 +1915,11 @@ export class MeetingService {
   }
 
   async postMeetingChatMessage(meetingId: string, userId: string, userRole: string, dto: CreateChatMessageDto) {
-    await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+
+    if (meeting.isClosed || meeting.status === Status.CANCELADA || meeting.status === Status.FINALIZADA) {
+      throw new BadRequestException('El chat de una reunion cancelada o finalizada es de solo lectura');
+    }
 
     return prisma.chatMessage.create({
       data: {
@@ -1883,23 +1949,37 @@ export class MeetingService {
     };
   }
 
+  private readonly pollInclude = {
+    createdBy: {
+      select: { id: true, name: true, role: true, email: true },
+    },
+    votes: {
+      include: {
+        voter: {
+          select: { id: true, name: true, role: true, email: true },
+        },
+      },
+    },
+  };
+
+  private async getPollView(pollId: string) {
+    const poll = await prisma.poll.findUniqueOrThrow({
+      where: { id: pollId },
+      include: this.pollInclude,
+    });
+
+    return {
+      ...poll,
+      results: this.mapPollResults(poll.votes),
+    };
+  }
+
   async listMeetingPolls(meetingId: string, userId: string, userRole: string) {
     await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
 
     const polls = await prisma.poll.findMany({
       where: { meetingId },
-      include: {
-        createdBy: {
-          select: { id: true, name: true, role: true, email: true },
-        },
-        votes: {
-          include: {
-            voter: {
-              select: { id: true, name: true, role: true, email: true },
-            },
-          },
-        },
-      },
+      include: this.pollInclude,
       orderBy: { createdAt: 'desc' },
     });
 
@@ -1910,25 +1990,33 @@ export class MeetingService {
   }
 
   async createMeetingPoll(meetingId: string, userId: string, userRole: string, dto: CreatePollDto) {
-    await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
 
     if (userRole !== Role.SECRETARIO && userRole !== Role.ADMIN) {
       throw new ForbiddenException('Solo secretaria o coordinacion pueden crear votaciones');
     }
 
-    return prisma.poll.create({
+    if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
+      throw new BadRequestException('Solo se pueden crear votaciones durante una reunion en curso');
+    }
+
+    if (!meeting.hasQuorum) {
+      throw new BadRequestException('La reunion no tiene quorum; no se pueden abrir votaciones');
+    }
+
+    const poll = await prisma.poll.create({
       data: {
         meetingId,
         createdById: userId,
         question: dto.question.trim(),
       },
-      include: {
-        createdBy: {
-          select: { id: true, name: true, role: true, email: true },
-        },
-        votes: true,
-      },
+      include: this.pollInclude,
     });
+
+    return {
+      ...poll,
+      results: this.mapPollResults(poll.votes),
+    };
   }
 
   async voteMeetingPoll(
@@ -1938,7 +2026,19 @@ export class MeetingService {
     userRole: string,
     dto: VotePollDto,
   ) {
-    await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+
+    if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
+      throw new BadRequestException('Solo se puede votar durante una reunion en curso');
+    }
+
+    // Votan los convocados presentes; si la reunion no tiene lista de invitados, cualquiera con acceso.
+    if (meeting.attendance.length > 0) {
+      const entry = meeting.attendance.find((item) => item.userId === userId);
+      if (!entry || entry.status !== AttendanceStatus.PRESENTE) {
+        throw new ForbiddenException('Solo los participantes con asistencia presente pueden votar');
+      }
+    }
 
     const poll = await prisma.poll.findFirst({
       where: { id: pollId, meetingId },
@@ -1952,7 +2052,7 @@ export class MeetingService {
       throw new BadRequestException('La votacion ya fue cerrada');
     }
 
-    const vote = await prisma.pollVote.upsert({
+    await prisma.pollVote.upsert({
       where: {
         pollId_voterId: {
           pollId,
@@ -1969,11 +2069,7 @@ export class MeetingService {
       },
     });
 
-    const votes = await prisma.pollVote.findMany({ where: { pollId } });
-    return {
-      vote,
-      results: this.mapPollResults(votes),
-    };
+    return this.getPollView(pollId);
   }
 
   async closeMeetingPoll(meetingId: string, pollId: string, userRole: string) {
@@ -1983,45 +2079,22 @@ export class MeetingService {
 
     const poll = await prisma.poll.findFirst({
       where: { id: pollId, meetingId },
-      include: {
-        votes: true,
-      },
     });
 
     if (!poll) {
       throw new NotFoundException('Votacion no encontrada para esta reunion');
     }
 
-    if (poll.status === PollStatus.CLOSED) {
-      return {
-        ...poll,
-        results: this.mapPollResults(poll.votes),
-      };
+    if (poll.status !== PollStatus.CLOSED) {
+      await prisma.poll.update({
+        where: { id: pollId },
+        data: {
+          status: PollStatus.CLOSED,
+          closedAt: new Date(),
+        },
+      });
     }
 
-    const updated = await prisma.poll.update({
-      where: { id: pollId },
-      data: {
-        status: PollStatus.CLOSED,
-        closedAt: new Date(),
-      },
-      include: {
-        createdBy: {
-          select: { id: true, name: true, role: true, email: true },
-        },
-        votes: {
-          include: {
-            voter: {
-              select: { id: true, name: true, role: true, email: true },
-            },
-          },
-        },
-      },
-    });
-
-    return {
-      ...updated,
-      results: this.mapPollResults(updated.votes),
-    };
+    return this.getPollView(pollId);
   }
 }

@@ -1,6 +1,7 @@
 import { BadRequestException, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { join } from 'path';
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -42,9 +43,18 @@ async function bootstrap() {
         },
       }),
     );
+
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('API Actas UPT')
+      .setDescription('Gestion de reuniones, agenda, asistencia, chat, votaciones y actas')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
+    SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swaggerConfig));
+
     const port = process.env.PORT ?? 5000;
     await app.listen(port);
-    console.log(`Servidor iniciado en http://localhost:${port}`);
+    console.log(`Servidor iniciado en http://localhost:${port} (documentacion en /docs)`);
   } catch (error) {
     console.error('Error al iniciar el backend:', error);
     process.exit(1);

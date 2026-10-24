@@ -1,9 +1,11 @@
-import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, Request, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, Query, Request, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { diskStorage } from 'multer';
 import { extname, join } from 'path';
 import * as fs from 'fs';
 import { MeetingService } from './meeting.service';
+import { MeetingChatGateway } from './meeting-chat.gateway';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
@@ -21,10 +23,15 @@ import { CreatePollDto } from './dto/create-poll.dto';
 import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
 import { VotePollDto } from './dto/vote-poll.dto';
 
+@ApiTags('meetings')
+@ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('meetings')
 export class MeetingController {
-  constructor(private readonly meetingService: MeetingService) {}
+  constructor(
+    private readonly meetingService: MeetingService,
+    private readonly meetingChatGateway: MeetingChatGateway,
+  ) {}
 
   @Roles('ADMIN', 'SECRETARIO')
   @Post()
@@ -136,18 +143,24 @@ export class MeetingController {
 
   @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
   @Get(':id/chat')
-  listMeetingChatMessages(@Request() req: { user: { id: string; role: string } }, @Param('id') id: string) {
-    return this.meetingService.listMeetingChatMessages(id, req.user.id, req.user.role);
+  listMeetingChatMessages(
+    @Request() req: { user: { id: string; role: string } },
+    @Param('id') id: string,
+    @Query('after') after?: string,
+  ) {
+    return this.meetingService.listMeetingChatMessages(id, req.user.id, req.user.role, after);
   }
 
   @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
   @Post(':id/chat')
-  postMeetingChatMessage(
+  async postMeetingChatMessage(
     @Request() req: { user: { id: string; role: string } },
     @Param('id') id: string,
     @Body() dto: CreateChatMessageDto,
   ) {
-    return this.meetingService.postMeetingChatMessage(id, req.user.id, req.user.role, dto);
+    const created = await this.meetingService.postMeetingChatMessage(id, req.user.id, req.user.role, dto);
+    this.meetingChatGateway.emitChatMessage(id, created);
+    return created;
   }
 
   @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
@@ -158,33 +171,39 @@ export class MeetingController {
 
   @Roles('ADMIN', 'SECRETARIO')
   @Post(':id/polls')
-  createMeetingPoll(
+  async createMeetingPoll(
     @Request() req: { user: { id: string; role: string } },
     @Param('id') id: string,
     @Body() dto: CreatePollDto,
   ) {
-    return this.meetingService.createMeetingPoll(id, req.user.id, req.user.role, dto);
+    const poll = await this.meetingService.createMeetingPoll(id, req.user.id, req.user.role, dto);
+    this.meetingChatGateway.emitPollUpdate(id, poll);
+    return poll;
   }
 
   @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
   @Post(':id/polls/:pollId/vote')
-  voteMeetingPoll(
+  async voteMeetingPoll(
     @Request() req: { user: { id: string; role: string } },
     @Param('id') id: string,
     @Param('pollId') pollId: string,
     @Body() dto: VotePollDto,
   ) {
-    return this.meetingService.voteMeetingPoll(id, pollId, req.user.id, req.user.role, dto);
+    const poll = await this.meetingService.voteMeetingPoll(id, pollId, req.user.id, req.user.role, dto);
+    this.meetingChatGateway.emitPollUpdate(id, poll);
+    return poll;
   }
 
   @Roles('ADMIN', 'SECRETARIO')
   @Post(':id/polls/:pollId/close')
-  closeMeetingPoll(
+  async closeMeetingPoll(
     @Request() req: { user: { role: string } },
     @Param('id') id: string,
     @Param('pollId') pollId: string,
   ) {
-    return this.meetingService.closeMeetingPoll(id, pollId, req.user.role);
+    const poll = await this.meetingService.closeMeetingPoll(id, pollId, req.user.role);
+    this.meetingChatGateway.emitPollUpdate(id, poll);
+    return poll;
   }
 
   @Roles('ADMIN', 'SECRETARIO')
