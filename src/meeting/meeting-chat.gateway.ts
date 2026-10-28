@@ -65,7 +65,7 @@ export class MeetingChatGateway implements OnGatewayConnection {
     }
 
     try {
-      await this.meetingService.ensureUserCanAccessMeetingContext(meetingId, user.id, user.role);
+      await this.meetingService.ensureUserCanAccessMeetingChat(meetingId, user.id, user.role);
       await client.join(meetingRoom(meetingId));
       return { ok: true };
     } catch (error) {
@@ -88,5 +88,37 @@ export class MeetingChatGateway implements OnGatewayConnection {
 
   emitPollUpdate(meetingId: string, poll: unknown) {
     this.server?.to(meetingRoom(meetingId)).emit('poll:update', poll);
+  }
+
+  // Avisa el cambio de estado (inicio de votacion, cierre, cancelacion) para que los
+  // clientes bloqueen el chat y las votaciones sin esperar a recargar.
+  emitMeetingStatus(meeting: { id: string; status: string; isClosed: boolean; votingOpen: boolean }) {
+    this.server?.to(meetingRoom(meeting.id)).emit('meeting:status', {
+      meetingId: meeting.id,
+      status: meeting.status,
+      isClosed: meeting.isClosed,
+      votingOpen: meeting.votingOpen,
+    });
+
+    if (meeting.isClosed || meeting.status === 'FINALIZADA' || meeting.status === 'CANCELADA') {
+      void this.removeParticipantsFromRoom(meeting.id);
+    }
+  }
+
+  // Con la reunion cerrada solo Secretaria y Coordinacion siguen en la sala (lectura); los
+  // docentes dejan de recibir eventos aunque tengan la pantalla abierta.
+  private async removeParticipantsFromRoom(meetingId: string) {
+    if (!this.server) return;
+    try {
+      const sockets = await this.server.in(meetingRoom(meetingId)).fetchSockets();
+      for (const socket of sockets) {
+        const role = (socket.data.user as SocketUser | undefined)?.role;
+        if (role !== 'ADMIN' && role !== 'SECRETARIO') {
+          socket.leave(meetingRoom(meetingId));
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`No se pudo vaciar la sala ${meetingId}: ${(error as Error).message}`);
+    }
   }
 }

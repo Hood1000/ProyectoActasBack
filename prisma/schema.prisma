@@ -58,6 +58,9 @@ model Meeting {
   attendanceFinalized   Boolean      @default(false)
   attendanceFinalizedAt DateTime?
   agendaConsolidated    Boolean      @default(false)
+  votingOpen            Boolean      @default(false)
+  votingStartedAt       DateTime?
+  votingStartedById     String?
   evidenceSignaturesUrl String?
   isClosed              Boolean      @default(false)
   closedAt              DateTime?

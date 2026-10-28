@@ -2,15 +2,21 @@ import { Test } from '@nestjs/testing';
 import { MeetingController } from './meeting.controller';
 import { MeetingService } from './meeting.service';
 import { MeetingChatGateway } from './meeting-chat.gateway';
+import { StorageService } from '../storage/storage.service';
 
 describe('MeetingController', () => {
   let controller: MeetingController;
   let meetingService: {
+    closeMeeting: jest.Mock;
     confirmAttendanceForUser: jest.Mock;
+    ensureEvidenceUploadAllowed: jest.Mock;
     postMeetingChatMessage: jest.Mock;
+    setEvidenceReference: jest.Mock;
+    startVoting: jest.Mock;
     voteMeetingPoll: jest.Mock;
   };
-  let meetingChatGateway: { emitChatMessage: jest.Mock; emitPollUpdate: jest.Mock };
+  let meetingChatGateway: { emitChatMessage: jest.Mock; emitMeetingStatus: jest.Mock; emitPollUpdate: jest.Mock };
+  let storageService: { deleteQuietly: jest.Mock; upload: jest.Mock };
 
   beforeEach(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -19,8 +25,12 @@ describe('MeetingController', () => {
         {
           provide: MeetingService,
           useValue: {
+            closeMeeting: jest.fn(),
             confirmAttendanceForUser: jest.fn(),
+            ensureEvidenceUploadAllowed: jest.fn(),
             postMeetingChatMessage: jest.fn(),
+            setEvidenceReference: jest.fn(),
+            startVoting: jest.fn(),
             voteMeetingPoll: jest.fn(),
           },
         },
@@ -28,7 +38,15 @@ describe('MeetingController', () => {
           provide: MeetingChatGateway,
           useValue: {
             emitChatMessage: jest.fn(),
+            emitMeetingStatus: jest.fn(),
             emitPollUpdate: jest.fn(),
+          },
+        },
+        {
+          provide: StorageService,
+          useValue: {
+            deleteQuietly: jest.fn(),
+            upload: jest.fn(),
           },
         },
       ],
@@ -37,6 +55,7 @@ describe('MeetingController', () => {
     controller = moduleRef.get(MeetingController);
     meetingService = moduleRef.get(MeetingService);
     meetingChatGateway = moduleRef.get(MeetingChatGateway);
+    storageService = moduleRef.get(StorageService);
   });
 
   it('delegates attendance confirmation to the authenticated user', async () => {
@@ -79,5 +98,59 @@ describe('MeetingController', () => {
     });
     expect(meetingChatGateway.emitPollUpdate).toHaveBeenCalledWith('meeting-1', poll);
     expect(result).toBe(poll);
+  });
+
+  it('broadcasts the new status when voting starts', async () => {
+    const meeting = { id: 'meeting-1', status: 'EN_CURSO', isClosed: false, votingOpen: true };
+    meetingService.startVoting.mockResolvedValue(meeting);
+
+    await controller.startVoting({ user: { id: 'sec-1' } } as any, 'meeting-1');
+
+    expect(meetingService.startVoting).toHaveBeenCalledWith('meeting-1', 'sec-1');
+    expect(meetingChatGateway.emitMeetingStatus).toHaveBeenCalledWith(meeting);
+  });
+
+  it('broadcasts closed polls and the final status when the meeting is closed', async () => {
+    const meeting = { id: 'meeting-1', status: 'FINALIZADA', isClosed: true, votingOpen: false };
+    const poll = { id: 'poll-1', status: 'CLOSED' };
+    meetingService.closeMeeting.mockResolvedValue({ meeting, closedPolls: [poll] });
+
+    const result = await controller.closeMeeting('meeting-1');
+
+    expect(result).toBe(meeting);
+    expect(meetingChatGateway.emitPollUpdate).toHaveBeenCalledWith('meeting-1', poll);
+    expect(meetingChatGateway.emitMeetingStatus).toHaveBeenCalledWith(meeting);
+  });
+
+  it('rejects evidence whose content is not a supported file, even with a valid mimetype', async () => {
+    const file = { buffer: Buffer.from('MZ fake executable'), mimetype: 'application/pdf' } as any;
+
+    await expect(controller.uploadEvidenceFile('meeting-1', file)).rejects.toThrow('no corresponde');
+    expect(storageService.upload).not.toHaveBeenCalled();
+  });
+
+  it('uploads valid evidence and removes the replaced file', async () => {
+    const file = { buffer: Buffer.from('%PDF-1.7 contenido'), mimetype: 'application/pdf' } as any;
+    storageService.upload.mockResolvedValue('gs://bucket/meetings/meeting-1/evidence/x.pdf');
+    meetingService.setEvidenceReference.mockResolvedValue({ meeting: { id: 'meeting-1' }, previousReference: '/uploads/evidence/old.pdf' });
+
+    await controller.uploadEvidenceFile('meeting-1', file);
+
+    expect(meetingService.ensureEvidenceUploadAllowed).toHaveBeenCalledWith('meeting-1');
+    expect(storageService.upload).toHaveBeenCalledWith(
+      file.buffer,
+      expect.stringMatching(/^meetings\/meeting-1\/evidence\/[0-9a-f-]+\.pdf$/),
+      'application/pdf',
+    );
+    expect(storageService.deleteQuietly).toHaveBeenCalledWith('/uploads/evidence/old.pdf');
+  });
+
+  it('deletes the uploaded object if the meeting changed state during the upload', async () => {
+    const file = { buffer: Buffer.from('%PDF-1.7 contenido'), mimetype: 'application/pdf' } as any;
+    storageService.upload.mockResolvedValue('gs://bucket/meetings/meeting-1/evidence/x.pdf');
+    meetingService.setEvidenceReference.mockRejectedValue(new Error('cerrada'));
+
+    await expect(controller.uploadEvidenceFile('meeting-1', file)).rejects.toThrow('cerrada');
+    expect(storageService.deleteQuietly).toHaveBeenCalledWith('gs://bucket/meetings/meeting-1/evidence/x.pdf');
   });
 });

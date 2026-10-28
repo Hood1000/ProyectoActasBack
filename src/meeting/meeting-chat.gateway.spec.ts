@@ -4,7 +4,7 @@ import { MeetingChatGateway } from './meeting-chat.gateway';
 describe('MeetingChatGateway', () => {
   let gateway: MeetingChatGateway;
   let jwtService: { verify: jest.Mock };
-  let meetingService: { ensureUserCanAccessMeetingContext: jest.Mock };
+  let meetingService: { ensureUserCanAccessMeetingChat: jest.Mock };
 
   const buildClient = (token?: string) => ({
     handshake: { auth: { token } },
@@ -17,7 +17,7 @@ describe('MeetingChatGateway', () => {
 
   beforeEach(() => {
     jwtService = { verify: jest.fn() };
-    meetingService = { ensureUserCanAccessMeetingContext: jest.fn() };
+    meetingService = { ensureUserCanAccessMeetingChat: jest.fn() };
     gateway = new MeetingChatGateway(jwtService as any, meetingService as any);
   });
 
@@ -48,7 +48,7 @@ describe('MeetingChatGateway', () => {
 
     const ack = await gateway.joinMeeting(client as any, { meetingId: 'meeting-1' });
 
-    expect(meetingService.ensureUserCanAccessMeetingContext).toHaveBeenCalledWith('meeting-1', 'user-1', 'DOCENTE');
+    expect(meetingService.ensureUserCanAccessMeetingChat).toHaveBeenCalledWith('meeting-1', 'user-1', 'DOCENTE');
     expect(client.join).toHaveBeenCalledWith('meeting:meeting-1');
     expect(ack).toEqual({ ok: true });
   });
@@ -56,7 +56,7 @@ describe('MeetingChatGateway', () => {
   it('rejects the join when the user is not invited', async () => {
     const client = buildClient();
     client.data.user = { id: 'user-2', role: 'DOCENTE' };
-    meetingService.ensureUserCanAccessMeetingContext.mockRejectedValue(new ForbiddenException('sin acceso'));
+    meetingService.ensureUserCanAccessMeetingChat.mockRejectedValue(new ForbiddenException('sin acceso'));
 
     const ack = await gateway.joinMeeting(client as any, { meetingId: 'meeting-1' });
 
@@ -86,5 +86,31 @@ describe('MeetingChatGateway', () => {
 
     expect(to).toHaveBeenCalledWith('meeting:meeting-1');
     expect(emit).toHaveBeenCalledWith('poll:update', poll);
+  });
+
+  it('removes participants (but not managers) from the room when the meeting closes', async () => {
+    const emit = jest.fn();
+    const docente = { data: { user: { id: 'd', role: 'DOCENTE' } }, leave: jest.fn() };
+    const secretaria = { data: { user: { id: 's', role: 'SECRETARIO' } }, leave: jest.fn() };
+    gateway.server = {
+      to: jest.fn().mockReturnValue({ emit }),
+      in: jest.fn().mockReturnValue({ fetchSockets: jest.fn().mockResolvedValue([docente, secretaria]) }),
+    } as any;
+
+    gateway.emitMeetingStatus({ id: 'meeting-1', status: 'FINALIZADA', isClosed: true, votingOpen: false });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(emit).toHaveBeenCalledWith('meeting:status', expect.objectContaining({ status: 'FINALIZADA' }));
+    expect(docente.leave).toHaveBeenCalledWith('meeting:meeting-1');
+    expect(secretaria.leave).not.toHaveBeenCalled();
+  });
+
+  it('keeps everyone in the room while the meeting is still running', () => {
+    const inFn = jest.fn();
+    gateway.server = { to: jest.fn().mockReturnValue({ emit: jest.fn() }), in: inFn } as any;
+
+    gateway.emitMeetingStatus({ id: 'meeting-1', status: 'EN_CURSO', isClosed: false, votingOpen: true });
+
+    expect(inFn).not.toHaveBeenCalled();
   });
 });

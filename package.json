@@ -25,6 +25,7 @@
     "postbuild": "node -e \"const fs=require('fs'); fs.mkdirSync('dist/generated',{recursive:true}); fs.cpSync('generated', 'dist/generated', {recursive:true, force:true});\""
   },
   "dependencies": {
+    "@google-cloud/storage": "^8.4.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.3",
     "@nestjs/core": "^11.0.1",

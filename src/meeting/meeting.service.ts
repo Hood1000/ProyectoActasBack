@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   AbsenceAlertReviewStatus,
   AttendanceStatus,
@@ -7,6 +7,7 @@ import {
   NotificationType,
   PollOption,
   PollStatus,
+  Prisma,
   Role,
   Status,
 } from '../../generated/prisma';
@@ -23,7 +24,6 @@ import { ProposeAgendaPointDto } from './dto/propose-agenda-point.dto';
 import { ReviewAgendaPointDto } from './dto/review-agenda-point.dto';
 import { SetInviteesDto } from './dto/set-invitees.dto';
 import { UpdateMeetingLogisticsDto } from './dto/update-meeting-logistics.dto';
-import { UploadEvidenceDto } from './dto/upload-evidence.dto';
 import { CreateChatMessageDto } from './dto/create-chat-message.dto';
 import { CreatePollDto } from './dto/create-poll.dto';
 import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
@@ -423,16 +423,25 @@ export class MeetingService {
       }
 
       const summary = `Docente ${teacher.name} alcanzó ${absencesCount} inasistencias injustificadas en ${academicYear}.`;
-      const createdAlert = await prisma.absenceAlert.create({
-        data: {
-          teacherId: teacher.id,
-          meetingId: meeting.id,
-          academicYear,
-          threshold: MeetingService.ABSENCE_ALERT_THRESHOLD,
-          absencesCount,
-          summary,
-        },
-      });
+      let createdAlert: { id: string };
+      try {
+        createdAlert = await prisma.absenceAlert.create({
+          data: {
+            teacherId: teacher.id,
+            meetingId: meeting.id,
+            academicYear,
+            threshold: MeetingService.ABSENCE_ALERT_THRESHOLD,
+            absencesCount,
+            summary,
+          },
+        });
+      } catch (error) {
+        // Otra peticion concurrente ya creo la alerta: no es un error para quien marco asistencia.
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+          continue;
+        }
+        throw error;
+      }
 
       await this.createSystemNotificationForUsers({
         absenceAlertId: createdAlert.id,
@@ -577,6 +586,33 @@ export class MeetingService {
       throw new NotFoundException('Reunion no encontrada');
     }
     return meeting;
+  }
+
+  // Bloquea la fila de la reunion dentro de una transaccion. FOR UPDATE serializa los
+  // cambios de estado (cerrar, cancelar, iniciar votacion); FOR SHARE deja que muchos
+  // mensajes o votos convivan, pero espera a que termine un cierre en curso.
+  private async lockMeeting(tx: Prisma.TransactionClient, id: string, mode: 'UPDATE' | 'SHARE' = 'UPDATE') {
+    const lockClause = mode === 'UPDATE' ? Prisma.sql`FOR UPDATE` : Prisma.sql`FOR SHARE`;
+    const rows = await tx.$queryRaw<
+      Array<{
+        id: string;
+        status: Status;
+        isClosed: boolean;
+        votingOpen: boolean;
+        hasQuorum: boolean;
+        attendanceFinalized: boolean;
+      }>
+    >`SELECT "id", "status", "isClosed", "votingOpen", "hasQuorum", "attendanceFinalized"
+      FROM "Meeting" WHERE "id" = ${id} ${lockClause}`;
+
+    if (rows.length === 0) {
+      throw new NotFoundException('Reunion no encontrada');
+    }
+    return rows[0];
+  }
+
+  private isMeetingReadOnly(meeting: { isClosed: boolean; status: Status }): boolean {
+    return meeting.isClosed || meeting.status === Status.CANCELADA || meeting.status === Status.FINALIZADA;
   }
 
   private ensureMeetingEditable(isClosed: boolean): void {
@@ -878,40 +914,51 @@ export class MeetingService {
   }
 
   private async refreshQuorum(meetingId: string): Promise<void> {
-    const meeting = await prisma.meeting.findUnique({
-      where: { id: meetingId },
-      select: {
-        meetingCategory: true,
-        attendance: {
-          select: {
-            status: true,
-            user: {
-              select: {
-                role: true,
+    // Se recalcula con la fila bloqueada: dos marcas de asistencia simultaneas no pueden
+    // dejar un hasQuorum calculado con datos viejos.
+    await prisma.$transaction(async (tx) => {
+      await this.lockMeeting(tx, meetingId);
+
+      const meeting = await tx.meeting.findUniqueOrThrow({
+        where: { id: meetingId },
+        select: {
+          meetingCategory: true,
+          organizerId: true,
+          attendance: {
+            select: {
+              status: true,
+              userId: true,
+              user: {
+                select: {
+                  role: true,
+                },
               },
             },
           },
         },
-      },
-    });
+      });
 
-    if (!meeting) {
-      throw new NotFoundException('Reunion no encontrada');
-    }
+      // Preside la secretaria; si no hay ninguna convocada, preside la coordinacion organizadora.
+      const secretaryInvited = meeting.attendance.some((entry) => entry.user.role === Role.SECRETARIO);
+      const isPresiding = (entry: (typeof meeting.attendance)[number]) =>
+        secretaryInvited
+          ? entry.user.role === Role.SECRETARIO
+          : entry.user.role === Role.ADMIN && entry.userId === meeting.organizerId;
 
-    const presentEntries = meeting.attendance.filter((entry) => entry.status === AttendanceStatus.PRESENTE);
-    const secretaryPresent = presentEntries.some((entry) => entry.user.role === Role.SECRETARIO);
-    const participantPresent = presentEntries.some((entry) => entry.user.role !== Role.SECRETARIO);
-    const quorumMinimo = this.quorumMinimum(meeting.meetingCategory);
+      const presentEntries = meeting.attendance.filter((entry) => entry.status === AttendanceStatus.PRESENTE);
+      const presidingPresent = presentEntries.some(isPresiding);
+      const participantPresent = presentEntries.some((entry) => !isPresiding(entry));
+      const quorumMinimo = this.quorumMinimum(meeting.meetingCategory);
 
-    const hasQuorum =
-      meeting.meetingCategory === MeetingCategory.ASAMBLEA
-        ? secretaryPresent
-        : secretaryPresent && participantPresent;
+      const hasQuorum =
+        meeting.meetingCategory === MeetingCategory.ASAMBLEA
+          ? presidingPresent
+          : presidingPresent && participantPresent;
 
-    await prisma.meeting.update({
-      where: { id: meetingId },
-      data: { quorumMinimo, hasQuorum },
+      await tx.meeting.update({
+        where: { id: meetingId },
+        data: { quorumMinimo, hasQuorum },
+      });
     });
   }
 
@@ -1105,23 +1152,35 @@ export class MeetingService {
     const meeting = await this.getMeetingOrThrow(id);
     this.ensureAcademicYearOpenByDate(meeting.date);
 
-    if (meeting.isClosed || meeting.status === Status.FINALIZADA) {
-      throw new ForbiddenException('No se puede cancelar una reunión finalizada');
-    }
+    const updated = await prisma.$transaction(async (tx) => {
+      // Con la fila bloqueada, ningun mensaje ni voto puede colarse durante la cancelacion.
+      const locked = await this.lockMeeting(tx, id);
 
-    if (meeting.status === Status.CANCELADA) {
-      throw new ForbiddenException('La reunión ya está cancelada');
-    }
+      if (locked.isClosed || locked.status === Status.FINALIZADA) {
+        throw new ForbiddenException('No se puede cancelar una reunión finalizada');
+      }
 
-    const updated = await prisma.meeting.update({
-      where: { id },
-      data: {
-        status: Status.CANCELADA,
-        cancellationReason: dto.reason,
-        cancelledAt: new Date(),
-        cancelledById: userId,
-      },
-      include: this.meetingInclude,
+      if (locked.status === Status.CANCELADA) {
+        throw new ForbiddenException('La reunión ya está cancelada');
+      }
+
+      const now = new Date();
+      await tx.poll.updateMany({
+        where: { meetingId: id, status: PollStatus.OPEN },
+        data: { status: PollStatus.CLOSED, closedAt: now },
+      });
+
+      return tx.meeting.update({
+        where: { id },
+        data: {
+          status: Status.CANCELADA,
+          votingOpen: false,
+          cancellationReason: dto.reason,
+          cancelledAt: now,
+          cancelledById: userId,
+        },
+        include: this.meetingInclude,
+      });
     });
 
     return this.mapMeetingView(updated);
@@ -1165,26 +1224,19 @@ export class MeetingService {
       throw new BadRequestException('La ventana de asistencia aun no se ha abierto');
     }
 
-    await prisma.attendance.upsert({
-      where: {
-        userId_meetingId: {
-          userId,
-          meetingId: id,
-        },
-      },
-      update: {
-        status: dto.status,
-        excuse: dto.excuse,
-        markedAt: new Date(),
-      },
-      create: {
-        userId,
-        meetingId: id,
+    // Solo se registra asistencia de convocados; los invitados se gestionan con setInvitees.
+    const updated = await prisma.attendance.updateMany({
+      where: { userId, meetingId: id },
+      data: {
         status: dto.status,
         excuse: dto.excuse,
         markedAt: new Date(),
       },
     });
+
+    if (updated.count === 0) {
+      throw new NotFoundException('El usuario no esta convocado a esta reunion');
+    }
 
     await this.refreshQuorum(id);
     await this.triggerAbsenceThresholdAlerts(id);
@@ -1195,6 +1247,10 @@ export class MeetingService {
     const meeting = await this.getMeetingOrThrow(meetingId);
     this.ensureAcademicYearOpenByDate(meeting.date);
     this.ensureMeetingEditable(meeting.isClosed);
+
+    if (meeting.status === Status.CANCELADA) {
+      throw new BadRequestException('La reunion fue cancelada');
+    }
 
     const currentUser = await prisma.user.findUnique({
       where: { id: userId },
@@ -1224,24 +1280,30 @@ export class MeetingService {
       throw new BadRequestException('La ventana de asistencia ya fue cerrada');
     }
 
-    await prisma.attendance.upsert({
-      where: {
-        userId_meetingId: {
-          userId,
-          meetingId,
-        },
-      },
-      update: {
-        status: AttendanceStatus.PRESENTE,
-        markedAt: new Date(),
-      },
-      create: {
-        userId,
-        meetingId,
-        status: AttendanceStatus.PRESENTE,
-        markedAt: new Date(),
-      },
+    const entry = await prisma.attendance.findUnique({
+      where: { userId_meetingId: { userId, meetingId } },
+      select: { status: true },
     });
+
+    if (!entry) {
+      throw new ForbiddenException('No estas convocado a esta reunion');
+    }
+
+    // Una ausencia o justificacion registrada por secretaria no se pisa con el autoregistro.
+    if (entry.status === AttendanceStatus.AUSENTE || entry.status === AttendanceStatus.JUSTIFICADA) {
+      throw new BadRequestException('Tu asistencia ya fue registrada por secretaria');
+    }
+
+    if (entry.status !== AttendanceStatus.PRESENTE) {
+      await prisma.attendance.updateMany({
+        where: { userId, meetingId, status: AttendanceStatus.PENDIENTE },
+        data: {
+          status: AttendanceStatus.PRESENTE,
+          excuse: null,
+          markedAt: new Date(),
+        },
+      });
+    }
 
     await this.refreshQuorum(meetingId);
     return this.findOne(meetingId);
@@ -1255,28 +1317,46 @@ export class MeetingService {
       throw new BadRequestException('La reunion no tiene cierre de asistencia configurado');
     }
 
+    if (meeting.isClosed || meeting.status === Status.CANCELADA) {
+      throw new BadRequestException('No se puede finalizar la asistencia de una reunion cerrada o cancelada');
+    }
+
     const now = new Date();
     if (now < meeting.attendanceClosesAt) {
       throw new BadRequestException('Aun no termina la ventana de asistencia');
     }
 
-    await prisma.attendance.updateMany({
-      where: {
-        meetingId: id,
-        status: AttendanceStatus.PENDIENTE,
-      },
-      data: {
-        status: AttendanceStatus.AUSENTE,
-      },
+    // El flag se marca de forma condicional: si dos llamadas compiten (scheduler y boton
+    // manual), solo una convierte los pendientes en ausentes y dispara las alertas.
+    const finalizedNow = await prisma.$transaction(async (tx) => {
+      const flagged = await tx.meeting.updateMany({
+        where: { id, attendanceFinalized: false },
+        data: {
+          attendanceFinalized: true,
+          attendanceFinalizedAt: now,
+        },
+      });
+
+      if (flagged.count === 0) {
+        return false;
+      }
+
+      await tx.attendance.updateMany({
+        where: {
+          meetingId: id,
+          status: AttendanceStatus.PENDIENTE,
+        },
+        data: {
+          status: AttendanceStatus.AUSENTE,
+        },
+      });
+
+      return true;
     });
 
-    await prisma.meeting.update({
-      where: { id },
-      data: {
-        attendanceFinalized: true,
-        attendanceFinalizedAt: new Date(),
-      },
-    });
+    if (!finalizedNow) {
+      return this.findOne(id);
+    }
 
     await this.refreshQuorum(id);
     await this.triggerAbsenceThresholdAlerts(id);
@@ -1393,60 +1473,147 @@ export class MeetingService {
     };
   }
 
-  async uploadEvidence(id: string, dto: UploadEvidenceDto) {
+  // Valida que la reunion admita evidencia antes de subir el archivo al almacenamiento.
+  async ensureEvidenceUploadAllowed(id: string) {
     const meeting = await this.getMeetingOrThrow(id);
     this.ensureAcademicYearOpenByDate(meeting.date);
     this.ensureMeetingEditable(meeting.isClosed);
 
-    const updated = await prisma.meeting.update({
+    if (meeting.status !== Status.EN_CURSO) {
+      throw new BadRequestException('El acta firmada solo se puede cargar durante una reunion en curso');
+    }
+
+    return meeting;
+  }
+
+  // Guarda la referencia del archivo ya subido y devuelve la anterior para que se elimine.
+  async setEvidenceReference(id: string, reference: string) {
+    const { updated, previousReference } = await prisma.$transaction(async (tx) => {
+      const locked = await this.lockMeeting(tx, id);
+      if (locked.isClosed || locked.status !== Status.EN_CURSO) {
+        throw new BadRequestException('El acta firmada solo se puede cargar durante una reunion en curso');
+      }
+
+      const current = await tx.meeting.findUniqueOrThrow({
+        where: { id },
+        select: { evidenceSignaturesUrl: true },
+      });
+
+      const saved = await tx.meeting.update({
+        where: { id },
+        data: { evidenceSignaturesUrl: reference },
+        include: this.meetingInclude,
+      });
+
+      return { updated: saved, previousReference: current.evidenceSignaturesUrl };
+    });
+
+    return { meeting: this.mapMeetingView(updated), previousReference };
+  }
+
+  async getEvidenceReference(id: string, userId: string, userRole: string) {
+    await this.ensureUserCanAccessMeetingContext(id, userId, userRole);
+    const meeting = await prisma.meeting.findUniqueOrThrow({
       where: { id },
-      data: { evidenceSignaturesUrl: dto.evidenceSignaturesUrl },
-      include: this.meetingInclude,
+      select: { evidenceSignaturesUrl: true },
+    });
+
+    if (!meeting.evidenceSignaturesUrl) {
+      throw new NotFoundException('La reunion no tiene acta firmada cargada');
+    }
+
+    return meeting.evidenceSignaturesUrl;
+  }
+
+  async startVoting(id: string, userId: string) {
+    const meeting = await this.getMeetingOrThrow(id);
+    this.ensureAcademicYearOpenByDate(meeting.date);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const locked = await this.lockMeeting(tx, id);
+
+      if (locked.isClosed || locked.status !== Status.EN_CURSO) {
+        throw new BadRequestException('La votacion solo puede iniciarse durante una reunion en curso');
+      }
+      if (locked.votingOpen) {
+        throw new ConflictException('La fase de votacion ya fue iniciada');
+      }
+      if (!locked.attendanceFinalized) {
+        throw new BadRequestException('Debe finalizarse la asistencia antes de iniciar la votacion');
+      }
+      if (!locked.hasQuorum) {
+        throw new BadRequestException('La reunion no tiene quorum; no se puede iniciar la votacion');
+      }
+
+      return tx.meeting.update({
+        where: { id },
+        data: { votingOpen: true, votingStartedAt: new Date(), votingStartedById: userId },
+        include: this.meetingInclude,
+      });
     });
 
     return this.mapMeetingView(updated);
   }
 
   async closeMeeting(id: string) {
-    const meeting = await prisma.meeting.findUnique({
-      where: { id },
-      include: this.meetingInclude,
-    });
-
-    if (!meeting) {
-      throw new NotFoundException('Reunion no encontrada');
-    }
-
+    const meeting = await this.getMeetingOrThrow(id);
     this.ensureAcademicYearOpenByDate(meeting.date);
 
-    this.ensureMeetingEditable(meeting.isClosed);
+    const { closed, closedPollIds } = await prisma.$transaction(async (tx) => {
+      // Bloqueo exclusivo: chat y votos esperan a que termine el cierre y luego ven FINALIZADA.
+      const locked = await this.lockMeeting(tx, id);
+      this.ensureMeetingEditable(locked.isClosed);
 
-    if (!meeting.evidenceSignaturesUrl) {
-      throw new BadRequestException('Debe cargarse el acta firmada antes de finalizar la reunion');
-    }
+      if (locked.status !== Status.EN_CURSO) {
+        throw new BadRequestException('Solo se puede finalizar una reunion en curso');
+      }
 
-    const totalInvited = meeting.attendance.length;
-    const presentCount = meeting.attendance.filter((entry) => entry.status === AttendanceStatus.PRESENTE).length;
-    const approvedAgendaCount = meeting.agendaPoints.filter((point) => point.status === AgendaStatus.APROBADO).length;
-    const summary = [
-      `Resumen final de la reunion ${meeting.title}.`,
-      `Asistentes registrados: ${presentCount}/${totalInvited}.`,
-      `Puntos aprobados en el orden del dia: ${approvedAgendaCount}.`,
-      `Acta firmada cargada al sistema.`,
-    ].join(' ');
+      const current = await tx.meeting.findUniqueOrThrow({
+        where: { id },
+        include: this.meetingInclude,
+      });
 
-    const closed = await prisma.meeting.update({
-      where: { id },
-      data: {
-        isClosed: true,
-        closedAt: new Date(),
-        finalSummary: summary,
-        status: Status.FINALIZADA,
-      },
-      include: this.meetingInclude,
+      if (!current.evidenceSignaturesUrl) {
+        throw new BadRequestException('Debe cargarse el acta firmada antes de finalizar la reunion');
+      }
+
+      const openPolls = await tx.poll.findMany({
+        where: { meetingId: id, status: PollStatus.OPEN },
+        select: { id: true },
+      });
+      const now = new Date();
+      await tx.poll.updateMany({
+        where: { meetingId: id, status: PollStatus.OPEN },
+        data: { status: PollStatus.CLOSED, closedAt: now },
+      });
+
+      const totalInvited = current.attendance.length;
+      const presentCount = current.attendance.filter((entry) => entry.status === AttendanceStatus.PRESENTE).length;
+      const approvedAgendaCount = current.agendaPoints.filter((point) => point.status === AgendaStatus.APROBADO).length;
+      const summary = [
+        `Resumen final de la reunion ${current.title}.`,
+        `Asistentes registrados: ${presentCount}/${totalInvited}.`,
+        `Puntos aprobados en el orden del dia: ${approvedAgendaCount}.`,
+        `Acta firmada cargada al sistema.`,
+      ].join(' ');
+
+      const updated = await tx.meeting.update({
+        where: { id },
+        data: {
+          isClosed: true,
+          closedAt: now,
+          finalSummary: summary,
+          status: Status.FINALIZADA,
+          votingOpen: false,
+        },
+        include: this.meetingInclude,
+      });
+
+      return { closed: updated, closedPollIds: openPolls.map((poll) => poll.id) };
     });
 
-    return this.mapMeetingView(closed);
+    const closedPolls = await Promise.all(closedPollIds.map((pollId) => this.getPollView(pollId)));
+    return { meeting: this.mapMeetingView(closed), closedPolls };
   }
 
   private dayKeyInInstitutionalZone(date: Date): string {
@@ -1464,42 +1631,51 @@ export class MeetingService {
     });
 
     const expired = candidates.filter((meeting) => this.dayKeyInInstitutionalZone(meeting.date) < todayKey);
-    if (expired.length === 0) {
-      return { cancelledMeetings: 0 };
+    const cancelledIds: string[] = [];
+
+    // Una por una y condicionada al estado: si alguien la modifico entre la lectura y la
+    // escritura, se respeta su cambio.
+    for (const meeting of expired) {
+      const result = await prisma.meeting.updateMany({
+        where: { id: meeting.id, isClosed: false, status: Status.PROGRAMADA },
+        data: {
+          status: Status.CANCELADA,
+          cancellationReason: MeetingService.AUTO_CANCEL_REASON,
+          cancelledAt: now,
+        },
+      });
+      if (result.count > 0) {
+        cancelledIds.push(meeting.id);
+      }
     }
 
-    const result = await prisma.meeting.updateMany({
-      where: { id: { in: expired.map((meeting) => meeting.id) } },
-      data: {
-        status: Status.CANCELADA,
-        cancellationReason: MeetingService.AUTO_CANCEL_REASON,
-        cancelledAt: now,
-      },
-    });
-
-    return { cancelledMeetings: result.count };
+    return { cancelledMeetings: cancelledIds.length, cancelledIds };
   }
 
   async syncAttendanceWindows() {
     const now = new Date();
 
-    const activated = await prisma.meeting.updateMany({
-      where: {
-        isClosed: false,
-        status: Status.PROGRAMADA,
-        date: {
-          lte: now,
-        },
-      },
-      data: {
-        status: Status.EN_CURSO,
-      },
+    const dueMeetings = await prisma.meeting.findMany({
+      where: { isClosed: false, status: Status.PROGRAMADA, date: { lte: now } },
+      select: { id: true },
     });
+
+    const activatedIds: string[] = [];
+    for (const meeting of dueMeetings) {
+      const result = await prisma.meeting.updateMany({
+        where: { id: meeting.id, isClosed: false, status: Status.PROGRAMADA },
+        data: { status: Status.EN_CURSO },
+      });
+      if (result.count > 0) {
+        activatedIds.push(meeting.id);
+      }
+    }
 
     const pendingMeetings = await prisma.meeting.findMany({
       where: {
         isClosed: false,
         attendanceFinalized: false,
+        status: { not: Status.CANCELADA },
         attendanceClosesAt: {
           lte: now,
         },
@@ -1507,13 +1683,24 @@ export class MeetingService {
       select: { id: true },
     });
 
+    const finalizedIds: string[] = [];
+    const failures: Array<{ id: string; error: string }> = [];
     for (const meeting of pendingMeetings) {
-      await this.finalizeAttendance(meeting.id);
+      // Un fallo en una reunion (p. ej. año lectivo cerrado) no detiene a las demas.
+      try {
+        await this.finalizeAttendance(meeting.id);
+        finalizedIds.push(meeting.id);
+      } catch (error) {
+        failures.push({ id: meeting.id, error: (error as Error).message });
+      }
     }
 
     return {
-      activatedMeetings: activated.count,
-      finalizedMeetings: pendingMeetings.length,
+      activatedMeetings: activatedIds.length,
+      activatedIds,
+      finalizedMeetings: finalizedIds.length,
+      finalizedIds,
+      failures,
     };
   }
 
@@ -1875,6 +2062,7 @@ export class MeetingService {
         status: true,
         isClosed: true,
         hasQuorum: true,
+        votingOpen: true,
         attendance: { select: { userId: true, status: true } },
       },
     });
@@ -1895,8 +2083,38 @@ export class MeetingService {
     return meeting;
   }
 
+  /**
+   * Acceso al chat y las votaciones de la reunion. Secretaria y coordinacion entran siempre
+   * (con la reunion cerrada, solo en lectura). Un docente solo entra mientras la reunion esta
+   * abierta y si su asistencia quedo confirmada como presente.
+   */
+  async ensureUserCanAccessMeetingChat(meetingId: string, userId: string, userRole: string) {
+    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+
+    if (userRole === Role.ADMIN || userRole === Role.SECRETARIO) {
+      return meeting;
+    }
+
+    if (this.isMeetingReadOnly(meeting)) {
+      throw new ForbiddenException(
+        'La reunion ya fue cerrada; solo Secretaria y Coordinacion pueden consultar su chat',
+      );
+    }
+
+    const entry = meeting.attendance.find((item) => item.userId === userId);
+    if (!entry) {
+      throw new ForbiddenException('No estas convocado a esta reunion');
+    }
+
+    if (entry.status !== AttendanceStatus.PRESENTE) {
+      throw new ForbiddenException('Debes confirmar tu asistencia para entrar al chat de la reunion');
+    }
+
+    return meeting;
+  }
+
   async listMeetingChatMessages(meetingId: string, userId: string, userRole: string, after?: string) {
-    await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
     const afterDate = after ? new Date(after) : null;
     if (afterDate && Number.isNaN(afterDate.getTime())) {
@@ -1915,23 +2133,33 @@ export class MeetingService {
   }
 
   async postMeetingChatMessage(meetingId: string, userId: string, userRole: string, dto: CreateChatMessageDto) {
-    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
-    if (meeting.isClosed || meeting.status === Status.CANCELADA || meeting.status === Status.FINALIZADA) {
-      throw new BadRequestException('El chat de una reunion cancelada o finalizada es de solo lectura');
+    const content = dto.content.trim();
+    if (!content) {
+      throw new BadRequestException('El mensaje no puede estar vacio');
     }
 
-    return prisma.chatMessage.create({
-      data: {
-        meetingId,
-        authorId: userId,
-        content: dto.content.trim(),
-      },
-      include: {
-        author: {
-          select: { id: true, name: true, role: true, email: true },
+    return prisma.$transaction(async (tx) => {
+      // El estado se vuelve a leer con la fila bloqueada: si la reunion se esta cerrando o
+      // cancelando en este instante, el mensaje espera y luego se rechaza.
+      const locked = await this.lockMeeting(tx, meetingId, 'SHARE');
+      if (this.isMeetingReadOnly(locked)) {
+        throw new ForbiddenException('La reunion esta cancelada o finalizada; el chat es de solo lectura');
+      }
+
+      return tx.chatMessage.create({
+        data: {
+          meetingId,
+          authorId: userId,
+          content,
         },
-      },
+        include: {
+          author: {
+            select: { id: true, name: true, role: true, email: true },
+          },
+        },
+      });
     });
   }
 
@@ -1975,7 +2203,7 @@ export class MeetingService {
   }
 
   async listMeetingPolls(meetingId: string, userId: string, userRole: string) {
-    await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
     const polls = await prisma.poll.findMany({
       where: { meetingId },
@@ -1990,27 +2218,35 @@ export class MeetingService {
   }
 
   async createMeetingPoll(meetingId: string, userId: string, userRole: string, dto: CreatePollDto) {
-    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
     if (userRole !== Role.SECRETARIO && userRole !== Role.ADMIN) {
       throw new ForbiddenException('Solo secretaria o coordinacion pueden crear votaciones');
     }
 
-    if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
-      throw new BadRequestException('Solo se pueden crear votaciones durante una reunion en curso');
-    }
+    const poll = await prisma.$transaction(async (tx) => {
+      const meeting = await this.lockMeeting(tx, meetingId, 'SHARE');
 
-    if (!meeting.hasQuorum) {
-      throw new BadRequestException('La reunion no tiene quorum; no se pueden abrir votaciones');
-    }
+      if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
+        throw new BadRequestException('Solo se pueden crear votaciones durante una reunion en curso');
+      }
 
-    const poll = await prisma.poll.create({
-      data: {
-        meetingId,
-        createdById: userId,
-        question: dto.question.trim(),
-      },
-      include: this.pollInclude,
+      if (!meeting.votingOpen) {
+        throw new BadRequestException('La fase de votacion aun no ha sido iniciada');
+      }
+
+      if (!meeting.hasQuorum) {
+        throw new BadRequestException('La reunion no tiene quorum; no se pueden abrir votaciones');
+      }
+
+      return tx.poll.create({
+        data: {
+          meetingId,
+          createdById: userId,
+          question: dto.question.trim(),
+        },
+        include: this.pollInclude,
+      });
     });
 
     return {
@@ -2026,47 +2262,54 @@ export class MeetingService {
     userRole: string,
     dto: VotePollDto,
   ) {
-    const meeting = await this.ensureUserCanAccessMeetingContext(meetingId, userId, userRole);
+    const access = await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
-    if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
-      throw new BadRequestException('Solo se puede votar durante una reunion en curso');
+    // Votan solo los convocados con asistencia presente.
+    const entry = access.attendance.find((item) => item.userId === userId);
+    if (!entry || entry.status !== AttendanceStatus.PRESENTE) {
+      throw new ForbiddenException('Solo los participantes convocados con asistencia presente pueden votar');
     }
 
-    // Votan los convocados presentes; si la reunion no tiene lista de invitados, cualquiera con acceso.
-    if (meeting.attendance.length > 0) {
-      const entry = meeting.attendance.find((item) => item.userId === userId);
-      if (!entry || entry.status !== AttendanceStatus.PRESENTE) {
-        throw new ForbiddenException('Solo los participantes con asistencia presente pueden votar');
+    await prisma.$transaction(async (tx) => {
+      // Orden de bloqueo reunion -> votacion, el mismo que usa el cierre: el voto no puede
+      // registrarse despues de que la votacion o la reunion se cierren.
+      const meeting = await this.lockMeeting(tx, meetingId, 'SHARE');
+
+      if (meeting.isClosed || meeting.status !== Status.EN_CURSO) {
+        throw new BadRequestException('Solo se puede votar durante una reunion en curso');
       }
-    }
 
-    const poll = await prisma.poll.findFirst({
-      where: { id: pollId, meetingId },
-    });
+      if (!meeting.votingOpen) {
+        throw new BadRequestException('La fase de votacion aun no ha sido iniciada');
+      }
 
-    if (!poll) {
-      throw new NotFoundException('Votacion no encontrada para esta reunion');
-    }
+      const polls = await tx.$queryRaw<Array<{ status: PollStatus }>>`
+        SELECT "status" FROM "Poll" WHERE "id" = ${pollId} AND "meetingId" = ${meetingId} FOR UPDATE`;
 
-    if (poll.status === PollStatus.CLOSED) {
-      throw new BadRequestException('La votacion ya fue cerrada');
-    }
+      if (polls.length === 0) {
+        throw new NotFoundException('Votacion no encontrada para esta reunion');
+      }
 
-    await prisma.pollVote.upsert({
-      where: {
-        pollId_voterId: {
+      if (polls[0].status === PollStatus.CLOSED) {
+        throw new BadRequestException('La votacion ya fue cerrada');
+      }
+
+      await tx.pollVote.upsert({
+        where: {
+          pollId_voterId: {
+            pollId,
+            voterId: userId,
+          },
+        },
+        update: {
+          option: dto.option,
+        },
+        create: {
           pollId,
           voterId: userId,
+          option: dto.option,
         },
-      },
-      update: {
-        option: dto.option,
-      },
-      create: {
-        pollId,
-        voterId: userId,
-        option: dto.option,
-      },
+      });
     });
 
     return this.getPollView(pollId);
@@ -2077,23 +2320,29 @@ export class MeetingService {
       throw new ForbiddenException('Solo secretaria o coordinacion pueden cerrar votaciones');
     }
 
-    const poll = await prisma.poll.findFirst({
-      where: { id: pollId, meetingId },
+    await prisma.$transaction(async (tx) => {
+      const meeting = await this.lockMeeting(tx, meetingId, 'SHARE');
+      if (meeting.isClosed) {
+        throw new BadRequestException('La reunion ya fue finalizada');
+      }
+
+      const polls = await tx.$queryRaw<Array<{ status: PollStatus }>>`
+        SELECT "status" FROM "Poll" WHERE "id" = ${pollId} AND "meetingId" = ${meetingId} FOR UPDATE`;
+
+      if (polls.length === 0) {
+        throw new NotFoundException('Votacion no encontrada para esta reunion');
+      }
+
+      if (polls[0].status !== PollStatus.CLOSED) {
+        await tx.poll.update({
+          where: { id: pollId },
+          data: {
+            status: PollStatus.CLOSED,
+            closedAt: new Date(),
+          },
+        });
+      }
     });
-
-    if (!poll) {
-      throw new NotFoundException('Votacion no encontrada para esta reunion');
-    }
-
-    if (poll.status !== PollStatus.CLOSED) {
-      await prisma.poll.update({
-        where: { id: pollId },
-        data: {
-          status: PollStatus.CLOSED,
-          closedAt: new Date(),
-        },
-      });
-    }
 
     return this.getPollView(pollId);
   }

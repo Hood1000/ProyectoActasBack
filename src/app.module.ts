@@ -7,11 +7,13 @@ import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
 import { MeetingModule } from './meeting/meeting.module';
+import { StorageModule } from './storage/storage.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
+    StorageModule,
     AuthModule,
     UserModule,
     MeetingModule,

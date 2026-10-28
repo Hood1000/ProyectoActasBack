@@ -11,7 +11,9 @@ async function bootstrap() {
     const app = await NestFactory.create<NestExpressApplication>(AppModule);
     app.useGlobalFilters(new AllExceptionsFilter());
 
-    app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
+    // Solo los archivos del cierre anual son publicos. El acta firmada y demas evidencias
+    // se entregan con URL firmada (GET /meetings/:id/evidence/url).
+    app.useStaticAssets(join(process.cwd(), 'uploads', 'annual-archives'), { prefix: '/uploads/annual-archives' });
 
     const configuredOrigins = process.env.CORS_ORIGINS?.split(',')
       .map((origin) => origin.trim())

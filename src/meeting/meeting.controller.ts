@@ -1,9 +1,9 @@
-import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, Query, Request, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Request, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { diskStorage } from 'multer';
-import { extname, join } from 'path';
-import * as fs from 'fs';
+import { memoryStorage } from 'multer';
+import { randomUUID } from 'crypto';
+import type { Request as ExpressRequest } from 'express';
 import { MeetingService } from './meeting.service';
 import { MeetingChatGateway } from './meeting-chat.gateway';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -16,12 +16,24 @@ import { SetInviteesDto } from './dto/set-invitees.dto';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
 import { ProposeAgendaPointDto } from './dto/propose-agenda-point.dto';
 import { ReviewAgendaPointDto } from './dto/review-agenda-point.dto';
-import { UploadEvidenceDto } from './dto/upload-evidence.dto';
 import { AnnualCloseDto } from './dto/annual-close.dto';
 import { CreateChatMessageDto } from './dto/create-chat-message.dto';
 import { CreatePollDto } from './dto/create-poll.dto';
 import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
 import { VotePollDto } from './dto/vote-poll.dto';
+import { StorageService } from '../storage/storage.service';
+import { detectFileSignature } from '../storage/file-signature';
+
+const MAX_UPLOAD_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 15 * 1024 * 1024);
+const ALLOWED_EVIDENCE_MIME_TYPES = [
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+];
+const EVIDENCE_FORMAT_ERROR = 'Solo se permiten archivos PDF, Word o imágenes (JPG, PNG, WebP) de hasta 15 MB';
 
 @ApiTags('meetings')
 @ApiBearerAuth()
@@ -31,6 +43,7 @@ export class MeetingController {
   constructor(
     private readonly meetingService: MeetingService,
     private readonly meetingChatGateway: MeetingChatGateway,
+    private readonly storageService: StorageService,
   ) {}
 
   @Roles('ADMIN', 'SECRETARIO')
@@ -103,8 +116,12 @@ export class MeetingController {
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.meetingService.findOne(id);
+  async findOne(@Param('id') id: string) {
+    const meeting = await this.meetingService.findOne(id);
+    if (!meeting) {
+      throw new NotFoundException('Reunion no encontrada');
+    }
+    return meeting;
   }
 
   @Roles('ADMIN', 'SECRETARIO')
@@ -115,12 +132,22 @@ export class MeetingController {
 
   @Roles('ADMIN', 'SECRETARIO')
   @Post(':id/cancel')
-  cancel(
+  async cancel(
     @Request() req: { user: { id: string } },
     @Param('id') id: string,
     @Body() dto: CancelMeetingDto,
   ) {
-    return this.meetingService.cancelMeeting(id, req.user.id, dto);
+    const meeting = await this.meetingService.cancelMeeting(id, req.user.id, dto);
+    this.meetingChatGateway.emitMeetingStatus(meeting);
+    return meeting;
+  }
+
+  @Roles('ADMIN', 'SECRETARIO')
+  @Post(':id/voting/start')
+  async startVoting(@Request() req: { user: { id: string } }, @Param('id') id: string) {
+    const meeting = await this.meetingService.startVoting(id, req.user.id);
+    this.meetingChatGateway.emitMeetingStatus(meeting);
+    return meeting;
   }
 
   @Roles('ADMIN', 'SECRETARIO')
@@ -240,55 +267,66 @@ export class MeetingController {
   }
 
   @Roles('ADMIN', 'SECRETARIO')
-  @Patch(':id/evidence')
-  uploadEvidence(@Param('id') id: string, @Body() dto: UploadEvidenceDto) {
-    return this.meetingService.uploadEvidence(id, dto);
+  @Post(':id/close')
+  async closeMeeting(@Param('id') id: string) {
+    const { meeting, closedPolls } = await this.meetingService.closeMeeting(id);
+    closedPolls.forEach((poll) => this.meetingChatGateway.emitPollUpdate(id, poll));
+    this.meetingChatGateway.emitMeetingStatus(meeting);
+    return meeting;
   }
 
-  @Roles('ADMIN', 'SECRETARIO')
-  @Post(':id/close')
-  closeMeeting(@Param('id') id: string) {
-    return this.meetingService.closeMeeting(id);
+  @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
+  @Get(':id/evidence/url')
+  async getEvidenceUrl(
+    @Request() req: ExpressRequest & { user: { id: string; role: string } },
+    @Param('id') id: string,
+  ) {
+    const reference = await this.meetingService.getEvidenceReference(id, req.user.id, req.user.role);
+    const baseUrl = process.env.PUBLIC_API_URL?.replace(/\/$/, '') || `${req.protocol}://${req.get('host')}`;
+    return this.storageService.getSignedReadUrl(reference, baseUrl);
   }
 
   @Roles('ADMIN', 'SECRETARIO')
   @Post(':id/evidence/upload')
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: diskStorage({
-        destination: (_req, _file, cb) => {
-          const dir = join(process.cwd(), 'uploads', 'evidence');
-          fs.mkdirSync(dir, { recursive: true });
-          cb(null, dir);
-        },
-        filename: (_req, file, cb) => {
-          cb(null, `${Date.now()}${extname(file.originalname)}`);
-        },
-      }),
+      // En memoria: el archivo se valida y se envia al almacenamiento sin tocar el disco.
+      storage: memoryStorage(),
       fileFilter: (_req, file, cb) => {
-        const allowed = [
-          'application/pdf',
-          'application/msword',
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          'image/jpeg',
-          'image/png',
-          'image/webp',
-        ];
-        if (allowed.includes(file.mimetype)) {
+        if (ALLOWED_EVIDENCE_MIME_TYPES.includes(file.mimetype)) {
           cb(null, true);
         } else {
-          cb(new Error('Solo se permiten archivos PDF, Word o imágenes') as unknown as null, false);
+          cb(new BadRequestException(EVIDENCE_FORMAT_ERROR), false);
         }
       },
-      limits: { fileSize: 15 * 1024 * 1024 },
+      limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
     }),
   )
-  uploadEvidenceFile(@Param('id') id: string, @UploadedFile() file: Express.Multer.File) {
+  async uploadEvidenceFile(@Param('id') id: string, @UploadedFile() file: Express.Multer.File) {
     if (!file) {
-      throw new BadRequestException('Solo se permiten archivos PDF, Word o imágenes (JPG, PNG, WebP) de hasta 15 MB');
+      throw new BadRequestException(EVIDENCE_FORMAT_ERROR);
     }
-    const fileUrl = `/uploads/evidence/${file.filename}`;
-    return this.meetingService.uploadEvidence(id, { evidenceSignaturesUrl: fileUrl });
+
+    const detected = detectFileSignature(file.buffer);
+    if (!detected) {
+      throw new BadRequestException('El contenido del archivo no corresponde a un PDF, Word o imagen valida');
+    }
+
+    // Se valida antes de subir para no dejar archivos huerfanos en el bucket.
+    await this.meetingService.ensureEvidenceUploadAllowed(id);
+
+    const key = `meetings/${id}/evidence/${randomUUID()}${detected.extension}`;
+    const reference = await this.storageService.upload(file.buffer, key, detected.contentType);
+
+    try {
+      const { meeting, previousReference } = await this.meetingService.setEvidenceReference(id, reference);
+      await this.storageService.deleteQuietly(previousReference);
+      return meeting;
+    } catch (error) {
+      // La reunion cambio de estado mientras se subia el archivo.
+      await this.storageService.deleteQuietly(reference);
+      throw error;
+    }
   }
 
   @Roles('ADMIN', 'SECRETARIO')
