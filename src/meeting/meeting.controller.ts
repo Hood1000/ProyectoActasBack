@@ -1,9 +1,9 @@
-import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Request, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Request, Res, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { memoryStorage } from 'multer';
 import { randomUUID } from 'crypto';
-import type { Request as ExpressRequest } from 'express';
+import type { Request as ExpressRequest, Response as ExpressResponse } from 'express';
 import { MeetingService } from './meeting.service';
 import { MeetingChatGateway } from './meeting-chat.gateway';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -59,14 +59,35 @@ export class MeetingController {
 
   @Roles('ADMIN', 'DOCENTE', 'SECRETARIO')
   @Get('agenda/available')
-  getAvailableAgenda(@Request() req: { user: { id: string; role: string } }) {
-    return this.meetingService.findAvailableAgendaForUser(req.user.id, req.user.role);
+  getAvailableAgenda(
+    @Request() req: { user: { id: string; role: string } },
+    @Query('meetingId') meetingId?: string,
+  ) {
+    return this.meetingService.findAvailableAgendaForUser(req.user.id, req.user.role, meetingId);
   }
 
   @Roles('ADMIN')
   @Get('annual-archives')
   listAnnualArchives() {
     return this.meetingService.listAnnualArchives();
+  }
+
+  @Roles('ADMIN')
+  @Get('annual-archives/:year/data')
+  getAnnualArchiveData(@Param('year') year: string) {
+    return this.meetingService.getAnnualArchiveData(Number(year));
+  }
+
+  @Roles('ADMIN')
+  @Get('annual-archives/:year/pdf')
+  async downloadAnnualReportPdf(@Param('year') year: string, @Res() res: ExpressResponse) {
+    const pdf = await this.meetingService.generateAnnualReportPdf(Number(year));
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="Cierre-anual-${year}.pdf"`,
+      'Content-Length': String(pdf.length),
+    });
+    res.end(pdf);
   }
 
   @Roles('ADMIN')

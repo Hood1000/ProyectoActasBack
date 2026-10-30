@@ -182,6 +182,7 @@ model AgendaPoint {
   title       String
   description String
   status      AgendaStatus @default(PENDIENTE)
+  reviewComment String?
   isBasePoint Boolean      @default(false)
   meeting     Meeting      @relation(fields: [meetingId], references: [id])
   meetingId   String

@@ -28,6 +28,7 @@ import { CreateChatMessageDto } from './dto/create-chat-message.dto';
 import { CreatePollDto } from './dto/create-poll.dto';
 import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
 import { VotePollDto } from './dto/vote-poll.dto';
+import puppeteer from 'puppeteer';
 
 type AnnualArchiveManifest = {
   backupFileName?: string;
@@ -54,6 +55,7 @@ type AnnualArchivePayload = {
       id: string;
       isBasePoint: boolean;
       proposer: { id: string; name: string; role: string } | null;
+      reviewComment: string | null;
       status: string;
       title: string;
       updatedAt: Date;
@@ -65,6 +67,7 @@ type AnnualArchivePayload = {
       user: { email: string; id: string; name: string; role: string };
     }>;
     attendanceFinalized: boolean;
+    cancellationReason: string | null;
     category: string;
     closedAt: Date | null;
     date: Date;
@@ -703,6 +706,14 @@ export class MeetingService {
   }
 
   private buildAnnualReportHtml(payload: AnnualArchivePayload): string {
+    const STATUS: Record<string, string> = { PROGRAMADA: 'Programada', EN_CURSO: 'En curso', FINALIZADA: 'Finalizada', CANCELADA: 'Cancelada' };
+    const POINT: Record<string, string> = { PENDIENTE: 'Pendiente', APROBADO: 'Aprobado', RECHAZADO: 'Rechazado' };
+    const ATT: Record<string, string> = { PENDIENTE: 'Pendiente', PRESENTE: 'Presente', AUSENTE: 'Ausente', JUSTIFICADA: 'Justificada' };
+    const ROLE: Record<string, string> = { ADMIN: 'Administrador', DOCENTE: 'Docente', SECRETARIO: 'Secretario' };
+    const CAT: Record<string, string> = { CONSEJO_CARRERA: 'Consejo Operativo (CICVSO)', CID_PEDAGOGICO: 'Consejo Pedagógico (CICVSP)', ASAMBLEA: 'Asambleas' };
+    const MOD: Record<string, string> = { PRESENCIAL: 'Presencial', VIRTUAL: 'Virtual', HIBRIDA: 'Híbrida' };
+    const label = (map: Record<string, string>, key: string) => map[key] || key;
+
     const summaryCards = [
       ['Reuniones registradas', String(payload.stats.meetingsTotal)],
       ['Reuniones cerradas', String(payload.stats.meetingsClosed)],
@@ -726,8 +737,8 @@ export class MeetingService {
                 (entry) => `
                   <tr>
                     <td>${this.escapeHtml(entry.user.name || 'Sin nombre')}</td>
-                    <td>${this.escapeHtml(entry.user.role || '-')}</td>
-                    <td>${this.escapeHtml(entry.status)}</td>
+                    <td>${this.escapeHtml(label(ROLE, entry.user.role) || '-')}</td>
+                    <td>${this.escapeHtml(label(ATT, entry.status))}</td>
                     <td>${this.escapeHtml(this.formatReportDate(entry.markedAt))}</td>
                     <td>${this.escapeHtml(entry.excuse || '-')}</td>
                   </tr>`,
@@ -741,13 +752,14 @@ export class MeetingService {
                 (point) => `
                   <tr>
                     <td>${this.escapeHtml(point.title)}</td>
-                    <td>${this.escapeHtml(point.status)}</td>
+                    <td><span class="badge badge--${point.status.toLowerCase()}">${this.escapeHtml(label(POINT, point.status))}</span></td>
                     <td>${this.escapeHtml(point.proposer?.name || 'Coordinación')}</td>
                     <td>${this.escapeHtml(point.isBasePoint ? 'Sí' : 'No')}</td>
+                    <td>${this.escapeHtml(point.status === 'RECHAZADO' ? point.reviewComment || 'No registrado' : '-')}</td>
                   </tr>`,
               )
               .join('')
-          : '<tr><td colspan="4">Sin puntos de agenda registrados.</td></tr>';
+          : '<tr><td colspan="5">Sin puntos de agenda registrados.</td></tr>';
 
         return `
           <section class="meeting">
@@ -756,17 +768,19 @@ export class MeetingService {
                 <h2>${index + 1}. ${this.escapeHtml(meeting.title)}</h2>
                 <p>${this.escapeHtml(meeting.description || 'Sin descripción registrada.')}</p>
               </div>
-              <span class="status">${this.escapeHtml(meeting.status)}</span>
+              <span class="status status--${meeting.status.toLowerCase()}">${this.escapeHtml(label(STATUS, meeting.status))}</span>
             </div>
 
             <div class="meta-grid">
               <div><strong>Fecha:</strong> ${this.escapeHtml(this.formatReportDate(meeting.date))}</div>
-              <div><strong>Categoría:</strong> ${this.escapeHtml(meeting.category)}</div>
-              <div><strong>Modalidad:</strong> ${this.escapeHtml(meeting.modality)}</div>
+              <div><strong>Categoría:</strong> ${this.escapeHtml(label(CAT, meeting.category))}</div>
+              <div><strong>Modalidad:</strong> ${this.escapeHtml(label(MOD, meeting.modality))}</div>
               <div><strong>Lugar:</strong> ${this.escapeHtml(meeting.location || 'No registrado')}</div>
               <div><strong>Organiza:</strong> ${this.escapeHtml(meeting.organizer.name)}</div>
               <div><strong>Quórum:</strong> ${this.escapeHtml(meeting.hasQuorum ? 'Alcanzado' : 'No alcanzado')}</div>
+              <div><strong>Puntos aprobados:</strong> ${meeting.agendaPoints.filter((p) => p.status === 'APROBADO').length}</div>
             </div>
+            ${meeting.status === 'CANCELADA' ? `<div class="notice"><strong>Motivo de cancelación:</strong> ${this.escapeHtml(meeting.cancellationReason || 'No se registró un motivo.')}</div>` : ''}
 
             <div class="block">
               <h3>Asistencia</h3>
@@ -793,6 +807,7 @@ export class MeetingService {
                     <th>Estado</th>
                     <th>Propuesto por</th>
                     <th>Base</th>
+                    <th>Motivo de rechazo</th>
                   </tr>
                 </thead>
                 <tbody>${agendaRows}</tbody>
@@ -835,11 +850,22 @@ export class MeetingService {
       table { width: 100%; border-collapse: collapse; font-size: 14px; }
       th, td { border: 1px solid #dbe4fa; padding: 10px; text-align: left; vertical-align: top; }
       th { background: #f3f7ff; color: #233253; }
-      @media print { body { background: #fff; } .page { padding: 0; } .hero, .meeting { box-shadow: none; } }
+      .status--programada { background: #eff6ff; color: #1d4ed8; }
+      .status--en_curso { background: #ecfdf5; color: #065f46; }
+      .status--finalizada { background: #f1f5f9; color: #334155; }
+      .status--cancelada { background: #fef2f2; color: #991b1b; }
+      .badge { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
+      .badge--aprobado { background: #ecfdf5; color: #065f46; }
+      .badge--rechazado { background: #fef2f2; color: #991b1b; }
+      .badge--pendiente { background: #fffbeb; color: #92400e; }
+      .notice { background: #fef2f2; border: 1px solid #fecaca; border-radius: 12px; color: #991b1b; padding: 12px 14px; margin: 6px 0 2px; }
+      .print-btn { position: fixed; top: 16px; right: 16px; z-index: 10; background: #1f3d7a; color: #fff; border: none; border-radius: 10px; padding: 12px 18px; font-size: 14px; font-weight: 700; cursor: pointer; box-shadow: 0 10px 24px rgba(20, 34, 66, 0.25); }
+      @media print { body { background: #fff; } .page { padding: 0; } .hero, .meeting { box-shadow: none; } .print-btn { display: none; } }
       @media (max-width: 900px) { .cards, .meta-grid { grid-template-columns: 1fr; } .meeting-head { flex-direction: column; } }
     </style>
   </head>
   <body>
+    <button class="print-btn" onclick="window.print()" type="button">Guardar como PDF</button>
     <main class="page">
       <section class="hero">
         <h1>Cierre anual ${this.escapeHtml(String(payload.year))}</h1>
@@ -850,23 +876,27 @@ export class MeetingService {
       </section>
       ${meetingsHtml || '<section class="meeting"><h2>Sin reuniones</h2><p>No se registraron reuniones en el período seleccionado.</p></section>'}
     </main>
+    <script>
+      if (location.search.indexOf('print') !== -1) {
+        window.addEventListener('load', function () { window.print(); });
+      }
+    </script>
   </body>
 </html>`;
   }
 
   private ensureReadableAnnualReport(manifest: AnnualArchiveManifest): AnnualArchiveManifest {
-    if (manifest.reportUrl) {
-      return manifest;
-    }
-
     const backupFileName = manifest.backupFileName || manifest.fileName;
     const backupUrl = manifest.backupUrl || manifest.fileUrl;
     const backupPath = join(this.annualArchiveDir, backupFileName);
 
-    if (!fs.existsSync(backupPath)) {
+    // Sin un backup .json.gz valido no se puede regenerar: se devuelve el manifiesto tal cual.
+    if (!backupFileName.endsWith('.json.gz') || !fs.existsSync(backupPath)) {
       return manifest;
     }
 
+    // Siempre se regenera el HTML desde el backup para que use la plantilla actual
+    // (incluye el boton y el auto-print para "Descargar PDF" aunque el reporte sea antiguo).
     const raw = fs.readFileSync(backupPath);
     const payload = JSON.parse(gunzipSync(raw).toString('utf-8')) as AnnualArchivePayload;
     const reportFileName = backupFileName.replace(/\.json\.gz$/, '.html');
@@ -1038,25 +1068,41 @@ export class MeetingService {
     };
   }
 
-  async findAvailableAgendaForUser(userId: string, userRole: string) {
+  async findAvailableAgendaForUser(userId: string, userRole: string, meetingId?: string) {
     const isPrivileged = userRole === 'ADMIN' || userRole === 'SECRETARIO';
-    const meeting = await prisma.meeting.findFirst({
+    const now = new Date();
+    // La recepción de agenda es para reuniones PROGRAMADAS que aún no inician.
+    // Se excluyen EN_CURSO y pasadas (p. ej. actas viejas atascadas en curso) para que no
+    // "tapen" a las reuniones reales que sí están abiertas a recibir puntos.
+    const openMeetings = await prisma.meeting.findMany({
       where: {
         agendaConsolidated: false,
         isClosed: false,
-        status: {
-          notIn: [Status.CANCELADA, Status.FINALIZADA],
-        },
+        status: Status.PROGRAMADA,
+        date: { gt: now },
       },
       include: this.meetingInclude,
       orderBy: { date: 'asc' },
     });
+
+    const meetingOptions = openMeetings.map((option) => ({
+      id: option.id,
+      title: option.title,
+      date: option.date,
+      category: option.meetingCategory,
+    }));
+
+    const meeting =
+      (meetingId ? openMeetings.find((option) => option.id === meetingId) : null) ||
+      openMeetings[0] ||
+      null;
 
     if (!meeting) {
       return {
         available: false,
         maxPointsPerUser: MeetingService.MAX_POINTS_PER_USER,
         meeting: null,
+        meetingOptions,
         message: 'No hay un acta disponible para registrar puntos en este momento.',
         myProposalCount: 0,
         myProposals: [],
@@ -1072,6 +1118,7 @@ export class MeetingService {
         available: false,
         maxPointsPerUser: MeetingService.MAX_POINTS_PER_USER,
         meeting: this.mapMeetingView(meeting),
+        meetingOptions,
         message: 'Existe un acta abierta, pero no formas parte de los invitados para esta agenda.',
         myProposalCount: 0,
         myProposals: [],
@@ -1087,6 +1134,7 @@ export class MeetingService {
         available: false,
         maxPointsPerUser: MeetingService.MAX_POINTS_PER_USER,
         meeting: this.mapMeetingView(meeting),
+        meetingOptions,
         message: 'La recepción de puntos se cierra 24 horas antes de la reunión para revisión de secretaría.',
         myProposalCount,
         myProposals,
@@ -1102,6 +1150,7 @@ export class MeetingService {
       available: true,
       maxPointsPerUser: isPrivileged ? 99 : MeetingService.MAX_POINTS_PER_USER,
       meeting: this.mapMeetingView(meeting),
+      meetingOptions,
       message: null,
       myProposalCount,
       myProposals,
@@ -1441,9 +1490,14 @@ export class MeetingService {
       throw new ForbiddenException('No puedes aprobar o rechazar tus propios puntos de agenda');
     }
 
+    const reviewComment = dto.reviewComment?.trim() || null;
+    if (dto.status === AgendaStatus.RECHAZADO && !reviewComment) {
+      throw new BadRequestException('Debes indicar el motivo del rechazo');
+    }
+
     return prisma.agendaPoint.update({
       where: { id: proposalId },
-      data: { status: dto.status },
+      data: { status: dto.status, reviewComment },
     });
   }
 
@@ -1742,6 +1796,7 @@ export class MeetingService {
                 role: point.proposer.role,
               }
             : null,
+          reviewComment: point.reviewComment,
           status: point.status,
           title: point.title,
           updatedAt: point.updatedAt,
@@ -1758,6 +1813,7 @@ export class MeetingService {
           },
         })),
         attendanceFinalized: meeting.attendanceFinalized,
+        cancellationReason: meeting.cancellationReason,
         category: meeting.meetingCategory,
         closedAt: meeting.closedAt,
         date: meeting.date,
@@ -1832,6 +1888,43 @@ export class MeetingService {
     }
 
     return migrated.sort((a, b) => b.year - a.year);
+  }
+
+  getAnnualArchiveData(year: number): AnnualArchivePayload {
+    const entry = this.readAnnualArchiveIndex().find((item) => item.year === year);
+    if (!entry) {
+      throw new NotFoundException(`No existe un cierre anual para el año ${year}`);
+    }
+
+    const backupFileName = entry.backupFileName || entry.fileName;
+    const backupPath = join(this.annualArchiveDir, backupFileName);
+    if (!backupFileName.endsWith('.json.gz') || !fs.existsSync(backupPath)) {
+      throw new NotFoundException('No se encontró el respaldo de datos del cierre anual');
+    }
+
+    const raw = fs.readFileSync(backupPath);
+    return JSON.parse(gunzipSync(raw).toString('utf-8')) as AnnualArchivePayload;
+  }
+
+  async generateAnnualReportPdf(year: number): Promise<Buffer> {
+    const payload = this.getAnnualArchiveData(year);
+    const html = this.buildAnnualReportHtml(payload);
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    try {
+      const page = await browser.newPage();
+      await page.setContent(html, { waitUntil: 'load' });
+      const pdf = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: { top: '12mm', bottom: '12mm', left: '10mm', right: '10mm' },
+      });
+      return Buffer.from(pdf);
+    } finally {
+      await browser.close();
+    }
   }
 
   async listAbsenceAlerts() {
@@ -2262,6 +2355,10 @@ export class MeetingService {
     userRole: string,
     dto: VotePollDto,
   ) {
+    if (dto.option === PollOption.ABSTENCION) {
+      throw new BadRequestException('El voto debe ser a favor o en contra');
+    }
+
     const access = await this.ensureUserCanAccessMeetingChat(meetingId, userId, userRole);
 
     // Votan solo los convocados con asistencia presente.
@@ -2334,6 +2431,22 @@ export class MeetingService {
       }
 
       if (polls[0].status !== PollStatus.CLOSED) {
+        const presentAttendees = await tx.attendance.findMany({
+          where: { meetingId, status: AttendanceStatus.PRESENTE },
+          select: { userId: true },
+        });
+        const votes = await tx.pollVote.findMany({
+          where: { pollId },
+          select: { voterId: true },
+        });
+        const votedIds = new Set(votes.map((vote) => vote.voterId));
+        const pending = presentAttendees.filter((att) => !votedIds.has(att.userId)).length;
+        if (pending > 0) {
+          throw new BadRequestException(
+            `Todos los presentes deben votar antes de cerrar la votacion. Faltan ${pending} por votar.`,
+          );
+        }
+
         await tx.poll.update({
           where: { id: pollId },
           data: {
