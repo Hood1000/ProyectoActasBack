@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Request, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Request, Res, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
+import type { Response as ExpressResponse } from 'express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { AttendanceReportService } from './attendance-report.service';
-import { AttendanceReportQueryDto, IssueWarningDto } from './dto/attendance-report.dto';
+import { AttendanceMonthlyReportDto, AttendanceReportQueryDto, IssueWarningDto } from './dto/attendance-report.dto';
 
 @Controller('meetings')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -12,15 +13,27 @@ export class AttendanceReportController {
   constructor(private readonly reports: AttendanceReportService) {}
 
   @Get('attendance/history')
-  @Roles('ADMIN')
+  @Roles('ADMIN', 'SECRETARIO')
   summary(@Query() query: AttendanceReportQueryDto) {
     return this.reports.summary(query);
   }
 
   @Get('attendance/history/:teacherId')
-  @Roles('ADMIN')
+  @Roles('ADMIN', 'SECRETARIO')
   history(@Param('teacherId', ParseUUIDPipe) teacherId: string, @Query() query: AttendanceReportQueryDto) {
     return this.reports.history(teacherId, query);
+  }
+
+  @Get('attendance/report/pdf')
+  @Roles('ADMIN', 'SECRETARIO')
+  async monthlyReportPdf(@Query() query: AttendanceMonthlyReportDto, @Res() res: ExpressResponse) {
+    const pdf = await this.reports.monthlyReportPdf(query.year, query.month);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="Asistencia-docentes-${query.year}-${String(query.month).padStart(2, '0')}.pdf"`,
+      'Content-Length': String(pdf.length),
+    });
+    res.end(pdf);
   }
 
   @Get('absence-cases')

@@ -2,7 +2,8 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { AttendanceStatus, Prisma } from '../../generated/prisma';
 import prisma from '../prismaClient';
 import { AttendanceReportQueryDto, IssueWarningDto } from './dto/attendance-report.dto';
-import { attendanceScope, attendanceTotals } from './attendance-report.utils';
+import { attendanceScope, attendanceTotals, buildMonthlyReportHtml } from './attendance-report.utils';
+import { renderHtmlToPdf } from './pdf.utils';
 
 const teacherSelect = { id: true, name: true, cedula: true, isActive: true } as const;
 const warningSelect = {
@@ -46,6 +47,33 @@ export class AttendanceReportService {
     ]);
     const totals = attendanceTotals(groups);
     return { teacher, ...totals, items, page: query.page, limit: query.limit };
+  }
+
+  async monthlyReport(year: number, month: number) {
+    const [records, teachers] = await Promise.all([
+      prisma.attendance.findMany({
+        where: attendanceScope(year, month),
+        select: { ...absenceSelect, user: { select: teacherSelect } },
+        orderBy: [{ meeting: { date: 'asc' } }, { id: 'asc' }],
+      }),
+      prisma.user.findMany({ where: { role: 'DOCENTE', isActive: true }, select: teacherSelect }),
+    ]);
+    const byTeacher = new Map<string, { teacher: typeof teachers[number]; records: typeof records }>();
+    for (const teacher of teachers) byTeacher.set(teacher.id, { teacher, records: [] });
+    for (const record of records) {
+      if (!byTeacher.has(record.userId)) byTeacher.set(record.userId, { teacher: record.user, records: [] });
+      byTeacher.get(record.userId)!.records.push(record);
+    }
+    const rows = [...byTeacher.values()].map(({ teacher, records: own }) => ({
+      teacher,
+      ...attendanceTotals(own.map((record) => ({ status: record.status, _count: { _all: 1 } }))),
+      records: own.map(({ id, status, excuse, meeting }) => ({ id, status, excuse, meeting })),
+    })).sort((a, b) => a.teacher.name.localeCompare(b.teacher.name, 'es'));
+    return { year, month, meetingsCount: new Set(records.map((record) => record.meeting.id)).size, teachers: rows };
+  }
+
+  async monthlyReportPdf(year: number, month: number) {
+    return renderHtmlToPdf(buildMonthlyReportHtml(await this.monthlyReport(year, month)));
   }
 
   private absenceWhere(year: number): Prisma.AttendanceWhereInput {

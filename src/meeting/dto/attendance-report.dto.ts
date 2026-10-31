@@ -33,6 +33,20 @@ export class AttendanceReportQueryDto {
   search?: string;
 }
 
+export class AttendanceMonthlyReportDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(2000)
+  @Max(2200)
+  year: number;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(12)
+  month: number;
+}
+
 export class IssueWarningDto {
   @Type(() => Number)
   @IsInt()

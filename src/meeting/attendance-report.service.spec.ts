@@ -1,7 +1,7 @@
 import { AttendanceStatus, Prisma } from '../../generated/prisma';
 import prisma from '../prismaClient';
 import { AttendanceReportService } from './attendance-report.service';
-import { attendanceScope, attendanceTotals } from './attendance-report.utils';
+import { attendanceScope, attendanceTotals, buildMonthlyReportHtml } from './attendance-report.utils';
 import { AttendanceReportQueryDto } from './dto/attendance-report.dto';
 import { scopeMeetingAttendance } from './meeting-attendance.interceptor';
 import { ExecutionContext, INestApplication, UnauthorizedException } from '@nestjs/common';
@@ -11,6 +11,7 @@ import { AttendanceReportController } from './attendance-report.controller';
 import { RolesGuard } from '../auth/roles.guard';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
+jest.mock('puppeteer', () => ({ __esModule: true, default: {} }));
 jest.mock('../prismaClient', () => ({ __esModule: true, default: {
   user: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   attendance: { findMany: jest.fn(), groupBy: jest.fn() },
@@ -70,6 +71,31 @@ describe('Attendance reports and manual warnings', () => {
     expect(prisma.attendance.groupBy).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: { in: ['teacher'] } }) }));
   });
 
+  it('builds the monthly report per teacher, including active teachers without records', async () => {
+    const other = { id: 'other', name: 'Ana', cedula: null, isActive: false };
+    const meeting = (id: string, date: string) => ({ id, title: `Consejo ${id}`, date: new Date(date), meetingCategory: 'ASAMBLEA' });
+    (prisma.attendance.findMany as jest.Mock).mockResolvedValue([
+      { id: 'a1', userId: teacher.id, status: 'PRESENTE', excuse: null, meeting: meeting('m1', '2026-10-05T14:00:00Z'), user: teacher },
+      { id: 'a2', userId: teacher.id, status: 'AUSENTE', excuse: null, meeting: meeting('m2', '2026-10-12T14:00:00Z'), user: teacher },
+      { id: 'a3', userId: other.id, status: 'JUSTIFICADA', excuse: 'Reposo <medico>', meeting: meeting('m2', '2026-10-12T14:00:00Z'), user: other },
+    ]);
+    (prisma.user.findMany as jest.Mock).mockResolvedValue([teacher, { id: 'idle', name: 'Zoe', cedula: '9', isActive: true }]);
+    const report = await service.monthlyReport(2026, 10);
+    expect(prisma.attendance.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ user: { role: 'DOCENTE' }, meeting: expect.objectContaining({ attendanceFinalized: true }) }) }));
+    expect(report.meetingsCount).toBe(2);
+    expect(report.teachers.map((row) => row.teacher.name)).toEqual(['Ana', 'Docente', 'Zoe']);
+    expect(report.teachers[1]).toMatchObject({ present: 1, absent: 1, justified: 0, total: 2, percentage: 50 });
+    expect(report.teachers[1].records.map((record) => record.id)).toEqual(['a1', 'a2']);
+    expect(report.teachers[2]).toMatchObject({ total: 0, percentage: null, records: [] });
+    const html = buildMonthlyReportHtml(report);
+    expect(html).toContain('class="letterhead"');
+    expect(html).toContain('data:image/jpeg;base64,');
+    expect(html).toContain('Octubre 2026');
+    expect(html).toContain('Reposo &lt;medico&gt;');
+    expect(html).toContain('50 %');
+    expect(buildMonthlyReportHtml({ year: 2026, month: 11, meetingsCount: 0, teachers: [] })).toContain('No hay reuniones');
+  });
+
   it('persists issuer and a fixed snapshot only on manual issuance', async () => {
     await service.issue(teacher.id, issuer.id, dto);
     expect(prisma.absenceAlert.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
@@ -119,7 +145,7 @@ describe('Attendance report HTTP permissions', () => {
     const module = await Test.createTestingModule({
       controllers: [AttendanceReportController],
       providers: [RolesGuard, { provide: AttendanceReportService, useValue: {
-        summary: () => ({}), history: () => ({}), cases: () => ({}),
+        summary: () => ({}), history: () => ({}), cases: () => ({}), monthlyReportPdf: () => Buffer.from('%PDF'),
         issue: () => ({}), warnings: () => ({}), warning: () => ({}),
       } }],
     }).overrideGuard(JwtAuthGuard).useValue({ canActivate(context: ExecutionContext) {
@@ -134,9 +160,17 @@ describe('Attendance report HTTP permissions', () => {
 
   afterAll(async () => { await app.close(); });
 
-  it.each(['SECRETARIO', 'DOCENTE'])('denies complete history to %s', async (role) => {
-    await request(app.getHttpServer()).get('/meetings/attendance/history').set('x-test-role', role).expect(403);
-    await request(app.getHttpServer()).get(`/meetings/attendance/history/${teacherId}`).set('x-test-role', role).expect(403);
+  it('denies complete history and monthly report to DOCENTE', async () => {
+    await request(app.getHttpServer()).get('/meetings/attendance/history').set('x-test-role', 'DOCENTE').expect(403);
+    await request(app.getHttpServer()).get(`/meetings/attendance/history/${teacherId}`).set('x-test-role', 'DOCENTE').expect(403);
+    await request(app.getHttpServer()).get('/meetings/attendance/report/pdf?year=2026&month=10').set('x-test-role', 'DOCENTE').expect(403);
+  });
+
+  it.each(['ADMIN', 'SECRETARIO'])('lets %s read history and download the monthly PDF', async (role) => {
+    await request(app.getHttpServer()).get(`/meetings/attendance/history/${teacherId}`).set('x-test-role', role).expect(200);
+    await request(app.getHttpServer()).get('/meetings/attendance/report/pdf?year=2026&month=10').set('x-test-role', role)
+      .expect(200).expect('Content-Type', 'application/pdf').expect('Content-Disposition', 'attachment; filename="Asistencia-docentes-2026-10.pdf"');
+    await request(app.getHttpServer()).get('/meetings/attendance/report/pdf?year=2026').set('x-test-role', role).expect(400);
   });
 
   it('allows ADMIN history and denies unauthenticated access and invalid filters', async () => {

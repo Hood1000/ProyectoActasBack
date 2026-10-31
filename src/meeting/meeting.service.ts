@@ -28,7 +28,7 @@ import { CreateChatMessageDto } from './dto/create-chat-message.dto';
 import { CreatePollDto } from './dto/create-poll.dto';
 import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
 import { VotePollDto } from './dto/vote-poll.dto';
-import puppeteer from 'puppeteer';
+import { escapeHtml, letterheadHtml, renderHtmlToPdf } from './pdf.utils';
 
 type AnnualArchiveManifest = {
   backupFileName?: string;
@@ -668,12 +668,7 @@ export class MeetingService {
   }
 
   private escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
+    return escapeHtml(value);
   }
 
   private formatReportDate(value: Date | string | null | undefined): string {
@@ -849,6 +844,7 @@ export class MeetingService {
   <body>
     <button class="print-btn" onclick="window.print()" type="button">Guardar como PDF</button>
     <main class="page">
+      ${letterheadHtml()}
       <section class="hero">
         <h1>Cierre anual ${this.escapeHtml(String(payload.year))}</h1>
         <p><strong>Fecha de cierre:</strong> ${this.escapeHtml(this.formatReportDate(payload.closedAt))}</p>
@@ -1906,23 +1902,7 @@ export class MeetingService {
 
   async generateAnnualReportPdf(year: number): Promise<Buffer> {
     const payload = this.getAnnualArchiveData(year);
-    const html = this.buildAnnualReportHtml(payload);
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
-    try {
-      const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: 'load' });
-      const pdf = await page.pdf({
-        format: 'A4',
-        printBackground: true,
-        margin: { top: '12mm', bottom: '12mm', left: '10mm', right: '10mm' },
-      });
-      return Buffer.from(pdf);
-    } finally {
-      await browser.close();
-    }
+    return renderHtmlToPdf(this.buildAnnualReportHtml(payload));
   }
 
   async listAbsenceAlerts() {
