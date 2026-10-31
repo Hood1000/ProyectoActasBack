@@ -4,6 +4,8 @@ import { MeetingService } from './meeting.service';
 import { MeetingChatGateway } from './meeting-chat.gateway';
 import { StorageService } from '../storage/storage.service';
 
+jest.mock('puppeteer', () => ({ __esModule: true, default: {} }));
+
 describe('MeetingController', () => {
   let controller: MeetingController;
   let meetingService: {
@@ -110,15 +112,14 @@ describe('MeetingController', () => {
     expect(meetingChatGateway.emitMeetingStatus).toHaveBeenCalledWith(meeting);
   });
 
-  it('broadcasts closed polls and the final status when the meeting is closed', async () => {
+  it('broadcasts the final status when the meeting is closed', async () => {
     const meeting = { id: 'meeting-1', status: 'FINALIZADA', isClosed: true, votingOpen: false };
-    const poll = { id: 'poll-1', status: 'CLOSED' };
-    meetingService.closeMeeting.mockResolvedValue({ meeting, closedPolls: [poll] });
+    meetingService.closeMeeting.mockResolvedValue(meeting);
 
     const result = await controller.closeMeeting('meeting-1');
 
     expect(result).toBe(meeting);
-    expect(meetingChatGateway.emitPollUpdate).toHaveBeenCalledWith('meeting-1', poll);
+    expect(meetingChatGateway.emitPollUpdate).not.toHaveBeenCalled();
     expect(meetingChatGateway.emitMeetingStatus).toHaveBeenCalledWith(meeting);
   });
 

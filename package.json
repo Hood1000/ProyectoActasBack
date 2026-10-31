@@ -20,6 +20,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "ts-node src/scripts/seed-test-users.ts",
+    "db:seed:demo": "ts-node src/scripts/seed-demo-data.ts",
     "db:setup": "npm run db:migrate && npm run db:seed",
     "dev": "npx prisma generate && npm run build && copy .env dist\\.env >nul 2>nul && node -r dotenv/config dist/src/main.js",
     "postbuild": "node -e \"const fs=require('fs'); fs.mkdirSync('dist/generated',{recursive:true}); fs.cpSync('generated', 'dist/generated', {recursive:true, force:true});\""

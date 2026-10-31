@@ -292,8 +292,7 @@ export class MeetingController {
   @Roles('ADMIN', 'SECRETARIO')
   @Post(':id/close')
   async closeMeeting(@Param('id') id: string) {
-    const { meeting, closedPolls } = await this.meetingService.closeMeeting(id);
-    closedPolls.forEach((poll) => this.meetingChatGateway.emitPollUpdate(id, poll));
+    const meeting = await this.meetingService.closeMeeting(id);
     this.meetingChatGateway.emitMeetingStatus(meeting);
     return meeting;
   }

@@ -1,8 +1,8 @@
-import { IsString, MaxLength, MinLength } from 'class-validator';
+import { IsNotEmpty, IsString } from 'class-validator';
 
 export class CreatePollDto {
+  // Punto aprobado del orden del dia que se somete a votacion; la pregunta se genera a partir de el.
   @IsString()
-  @MinLength(5)
-  @MaxLength(500)
-  question!: string;
+  @IsNotEmpty()
+  agendaPointId!: string;
 }

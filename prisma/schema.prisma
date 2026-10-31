@@ -175,6 +175,10 @@ model Poll {
   id          String      @id @default(uuid())
   meeting     Meeting     @relation(fields: [meetingId], references: [id])
   meetingId   String
+  // Punto del orden del dia que se vota: cada votacion pertenece a un punto y cada punto
+  // tiene a lo sumo una votacion.
+  agendaPoint   AgendaPoint @relation(fields: [agendaPointId], references: [id])
+  agendaPointId String      @unique
   question    String
   status      PollStatus  @default(OPEN)
   createdById String
@@ -210,6 +214,7 @@ model AgendaPoint {
   meetingId   String
   proposer    User?        @relation("AgendaProposer", fields: [proposerId], references: [id])
   proposerId  String?
+  poll        Poll?
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
@@ -302,6 +307,8 @@ enum AgendaStatus {
   PENDIENTE
   APROBADO
   RECHAZADO
+  // Aprobado pero sin votar al finalizar la reunion: se arrastra a la proxima.
+  DIFERIDO
 }
 
 enum Dedicacion {

@@ -491,6 +491,14 @@ export class MeetingService {
     }));
   }
 
+  // La lectura del acta anterior es el punto obligatorio de toda reunion: se aprueba sin votacion.
+  private isPreviousMinutePoint(point: { title: string; isBasePoint: boolean }): boolean {
+    return (
+      point.isBasePoint &&
+      point.title.trim().toLowerCase() === MeetingService.PREVIOUS_MINUTE_POINT.title.trim().toLowerCase()
+    );
+  }
+
   private mapMeetingView<
     T extends {
       hasQuorum: boolean;
@@ -527,10 +535,10 @@ export class MeetingService {
       return null;
     }
 
-    // Puntos que quedaron sin resolver (PENDIENTE) en el acta anterior: se arrastran
-    // para retomarlos, no el orden del día ya aprobado.
+    // Puntos que quedaron sin resolver en el acta anterior (PENDIENTE sin revisar o DIFERIDO por
+    // no alcanzar a votarse): se arrastran para retomarlos, no el orden del día ya votado.
     const points = (previous.agendaPoints || [])
-      .filter((point) => point.status === AgendaStatus.PENDIENTE)
+      .filter((point) => point.status === AgendaStatus.PENDIENTE || point.status === AgendaStatus.DIFERIDO)
       .map((point) => ({ title: point.title, description: point.description }));
 
     return {
@@ -681,7 +689,7 @@ export class MeetingService {
 
   private buildAnnualReportHtml(payload: AnnualArchivePayload): string {
     const STATUS: Record<string, string> = { PROGRAMADA: 'Programada', EN_CURSO: 'En curso', FINALIZADA: 'Finalizada', CANCELADA: 'Cancelada' };
-    const POINT: Record<string, string> = { PENDIENTE: 'Pendiente', APROBADO: 'Aprobado', RECHAZADO: 'Rechazado' };
+    const POINT: Record<string, string> = { PENDIENTE: 'Pendiente', APROBADO: 'Aprobado', RECHAZADO: 'Rechazado', DIFERIDO: 'Diferido' };
     const ATT: Record<string, string> = { PENDIENTE: 'Pendiente', PRESENTE: 'Presente', AUSENTE: 'Ausente', JUSTIFICADA: 'Justificada' };
     const ROLE: Record<string, string> = { ADMIN: 'Administrador', DOCENTE: 'Docente', SECRETARIO: 'Secretario' };
     const CAT: Record<string, string> = { CONSEJO_CARRERA: 'Consejo Operativo (CICVSO)', CID_PEDAGOGICO: 'Consejo Pedagógico (CICVSP)', ASAMBLEA: 'Asambleas' };
@@ -1447,7 +1455,7 @@ export class MeetingService {
   }
 
   async reviewAgendaPoint(id: string, proposalId: string, reviewerId: string, dto: ReviewAgendaPointDto) {
-    if (dto.status === AgendaStatus.PENDIENTE) {
+    if (dto.status !== AgendaStatus.APROBADO && dto.status !== AgendaStatus.RECHAZADO) {
       throw new BadRequestException('Solo se permite aprobar o rechazar propuestas');
     }
 
@@ -1589,7 +1597,7 @@ export class MeetingService {
     const meeting = await this.getMeetingOrThrow(id);
     this.ensureAcademicYearOpenByDate(meeting.date);
 
-    const { closed, closedPollIds } = await prisma.$transaction(async (tx) => {
+    const closed = await prisma.$transaction(async (tx) => {
       // Bloqueo exclusivo: chat y votos esperan a que termine el cierre y luego ven FINALIZADA.
       const locked = await this.lockMeeting(tx, id);
       this.ensureMeetingEditable(locked.isClosed);
@@ -1607,27 +1615,44 @@ export class MeetingService {
         throw new BadRequestException('Debe cargarse el acta firmada antes de finalizar la reunion');
       }
 
-      const openPolls = await tx.poll.findMany({
-        where: { meetingId: id, status: PollStatus.OPEN },
-        select: { id: true },
-      });
-      const now = new Date();
-      await tx.poll.updateMany({
-        where: { meetingId: id, status: PollStatus.OPEN },
-        data: { status: PollStatus.CLOSED, closedAt: now },
-      });
+      // Una votacion abierta no se cierra a la fuerza: debe cerrarse con el voto de todos los presentes.
+      const openPolls = await tx.poll.count({ where: { meetingId: id, status: PollStatus.OPEN } });
+      if (openPolls > 0) {
+        throw new BadRequestException(
+          `Hay ${openPolls} votacion(es) abierta(s); cierrala(s) antes de finalizar la reunion`,
+        );
+      }
 
+      // Los puntos aprobados que no llegaron a votarse quedan diferidos para la proxima reunion.
+      // La lectura del acta anterior se aprueba sin votacion.
+      const votedPointIds = new Set(
+        (await tx.poll.findMany({ where: { meetingId: id }, select: { agendaPointId: true } })).map(
+          (poll) => poll.agendaPointId,
+        ),
+      );
+      const votablePoints = current.agendaPoints.filter(
+        (point) => point.status === AgendaStatus.APROBADO && !this.isPreviousMinutePoint(point),
+      );
+      const deferredIds = votablePoints.filter((point) => !votedPointIds.has(point.id)).map((point) => point.id);
+      if (deferredIds.length > 0) {
+        await tx.agendaPoint.updateMany({
+          where: { id: { in: deferredIds } },
+          data: { status: AgendaStatus.DIFERIDO },
+        });
+      }
+
+      const now = new Date();
       const totalInvited = current.attendance.length;
       const presentCount = current.attendance.filter((entry) => entry.status === AttendanceStatus.PRESENTE).length;
-      const approvedAgendaCount = current.agendaPoints.filter((point) => point.status === AgendaStatus.APROBADO).length;
       const summary = [
         `Resumen final de la reunion ${current.title}.`,
         `Asistentes registrados: ${presentCount}/${totalInvited}.`,
-        `Puntos aprobados en el orden del dia: ${approvedAgendaCount}.`,
+        `Puntos votados: ${votablePoints.length - deferredIds.length}.`,
+        `Puntos diferidos a la proxima reunion: ${deferredIds.length}.`,
         `Acta firmada cargada al sistema.`,
       ].join(' ');
 
-      const updated = await tx.meeting.update({
+      return tx.meeting.update({
         where: { id },
         data: {
           isClosed: true,
@@ -1638,12 +1663,9 @@ export class MeetingService {
         },
         include: this.meetingInclude,
       });
-
-      return { closed: updated, closedPollIds: openPolls.map((poll) => poll.id) };
     });
 
-    const closedPolls = await Promise.all(closedPollIds.map((pollId) => this.getPollView(pollId)));
-    return { meeting: this.mapMeetingView(closed), closedPolls };
+    return this.mapMeetingView(closed);
   }
 
   private dayKeyInInstitutionalZone(date: Date): string {
@@ -2259,6 +2281,9 @@ export class MeetingService {
         },
       },
     },
+    agendaPoint: {
+      select: { id: true, title: true },
+    },
   };
 
   private async getPollView(pollId: string) {
@@ -2310,14 +2335,43 @@ export class MeetingService {
         throw new BadRequestException('La reunion no tiene quorum; no se pueden abrir votaciones');
       }
 
+      // La votacion queda fijada a un punto aprobado de esta reunion, uno por punto.
+      const point = await tx.agendaPoint.findFirst({
+        where: { id: dto.agendaPointId, meetingId },
+        select: { id: true, title: true, status: true, isBasePoint: true, poll: { select: { id: true } } },
+      });
+
+      if (!point) {
+        throw new NotFoundException('El punto no pertenece al orden del dia de esta reunion');
+      }
+
+      if (point.status !== AgendaStatus.APROBADO) {
+        throw new BadRequestException('Solo se pueden votar puntos aprobados del orden del dia');
+      }
+
+      if (this.isPreviousMinutePoint(point)) {
+        throw new BadRequestException('La lectura del acta anterior se aprueba sin votacion');
+      }
+
+      if (point.poll) {
+        throw new ConflictException('Este punto ya tiene una votacion');
+      }
+
       return tx.poll.create({
         data: {
           meetingId,
+          agendaPointId: point.id,
           createdById: userId,
-          question: dto.question.trim(),
+          question: `¿Se aprueba el punto "${point.title}"?`,
         },
         include: this.pollInclude,
       });
+    }).catch((error: unknown) => {
+      // Dos aperturas simultaneas del mismo punto: el indice unico deja pasar solo una.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('Este punto ya tiene una votacion');
+      }
+      throw error;
     });
 
     return {
