@@ -16,7 +16,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import { gunzipSync, gzipSync } from 'zlib';
 import { join } from 'path';
-import nodemailer from 'nodemailer';
+import { MailService } from '../mail/mail.service';
 import { CancelMeetingDto } from './dto/cancel-meeting.dto';
 import { CreateMeetingDto } from './dto/create-meeting.dto';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
@@ -95,6 +95,8 @@ type AnnualArchivePayload = {
 
 @Injectable()
 export class MeetingService {
+  constructor(private readonly mailService: MailService) {}
+
   private static readonly MAX_POINTS_PER_USER = 2;
   private static readonly AUTO_CANCEL_REASON =
     'La reunión no se realizó en la fecha programada y fue cancelada automáticamente por el sistema.';
@@ -176,13 +178,7 @@ export class MeetingService {
     },
     type: 'created' | 'updated',
   ) {
-    const host = process.env.SMTP_HOST;
-    const port = Number(process.env.SMTP_PORT || 587);
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-    const from = process.env.SMTP_FROM || user;
-
-    if (!host || !user || !pass || !from) {
+    if (!this.mailService.isConfigured()) {
       return;
     }
 
@@ -190,13 +186,6 @@ export class MeetingService {
     if (recipients.length === 0) {
       return;
     }
-
-    const transporter = nodemailer.createTransport({
-      auth: { user, pass },
-      host,
-      port,
-      secure: port === 465,
-    });
 
     const subject =
       type === 'created'
@@ -228,8 +217,7 @@ export class MeetingService {
       </div>`;
 
     try {
-      await transporter.sendMail({
-        from,
+      await this.mailService.send({
         html,
         subject,
         to: recipients.map((recipient) => recipient.email).join(','),
@@ -246,13 +234,7 @@ export class MeetingService {
     meetingTitle: string;
     teacherName: string;
   }) {
-    const host = process.env.SMTP_HOST;
-    const port = Number(process.env.SMTP_PORT || 587);
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-    const from = process.env.SMTP_FROM || user;
-
-    if (!host || !user || !pass || !from) {
+    if (!this.mailService.isConfigured()) {
       return;
     }
 
@@ -271,13 +253,6 @@ export class MeetingService {
       return;
     }
 
-    const transporter = nodemailer.createTransport({
-      auth: { user, pass },
-      host,
-      port,
-      secure: port === 465,
-    });
-
     const subject = `Alerta de inasistencias: ${payload.teacherName}`;
     const html = `
       <div style="background:#f5f8ff;padding:24px;font-family:Arial,sans-serif;color:#172033;">
@@ -295,8 +270,7 @@ export class MeetingService {
       </div>`;
 
     try {
-      await transporter.sendMail({
-        from,
+      await this.mailService.send({
         html,
         subject,
         to: recipients.join(','),

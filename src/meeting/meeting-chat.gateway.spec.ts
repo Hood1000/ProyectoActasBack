@@ -1,10 +1,14 @@
 import { ForbiddenException } from '@nestjs/common';
 import { MeetingChatGateway } from './meeting-chat.gateway';
 
+jest.mock('puppeteer', () => ({ __esModule: true, default: {} }));
+
 describe('MeetingChatGateway', () => {
   let gateway: MeetingChatGateway;
   let jwtService: { verify: jest.Mock };
   let meetingService: { ensureUserCanAccessMeetingChat: jest.Mock };
+  let sessionService: { validateTokenPayload: jest.Mock; onRevoked: jest.Mock };
+  const sessionUser = { id: 'user-1', email: 'a@b.c', role: 'DOCENTE', authVersion: 0 };
 
   const buildClient = (token?: string) => ({
     handshake: { auth: { token } },
@@ -18,26 +22,31 @@ describe('MeetingChatGateway', () => {
   beforeEach(() => {
     jwtService = { verify: jest.fn() };
     meetingService = { ensureUserCanAccessMeetingChat: jest.fn() };
-    gateway = new MeetingChatGateway(jwtService as any, meetingService as any);
+    sessionService = {
+      validateTokenPayload: jest.fn().mockResolvedValue(sessionUser),
+      onRevoked: jest.fn().mockReturnValue(jest.fn()),
+    };
+    gateway = new MeetingChatGateway(jwtService as any, meetingService as any, sessionService as any);
   });
 
-  it('stores the JWT user on connection', () => {
+  it('stores the current database user on connection', async () => {
     const client = buildClient('valid');
     jwtService.verify.mockReturnValue({ sub: 'user-1', email: 'a@b.c', role: 'DOCENTE' });
 
-    gateway.handleConnection(client as any);
+    await gateway.handleConnection(client as any);
 
-    expect(client.data.user).toEqual({ id: 'user-1', email: 'a@b.c', role: 'DOCENTE' });
+    expect(client.data.user).toEqual(sessionUser);
+    expect(client.join).toHaveBeenCalledWith('session:user-1');
     expect(client.disconnect).not.toHaveBeenCalled();
   });
 
-  it('disconnects sockets with an invalid token', () => {
+  it('disconnects sockets with an invalid token', async () => {
     const client = buildClient('bad');
     jwtService.verify.mockImplementation(() => {
       throw new Error('invalid');
     });
 
-    gateway.handleConnection(client as any);
+    await gateway.handleConnection(client as any);
 
     expect(client.disconnect).toHaveBeenCalledWith(true);
   });
@@ -56,12 +65,46 @@ describe('MeetingChatGateway', () => {
   it('rejects the join when the user is not invited', async () => {
     const client = buildClient();
     client.data.user = { id: 'user-2', role: 'DOCENTE' };
+    sessionService.validateTokenPayload.mockResolvedValue({ ...sessionUser, id: 'user-2' });
     meetingService.ensureUserCanAccessMeetingChat.mockRejectedValue(new ForbiddenException('sin acceso'));
 
     const ack = await gateway.joinMeeting(client as any, { meetingId: 'meeting-1' });
 
     expect(client.join).not.toHaveBeenCalled();
     expect(ack).toEqual({ ok: false, error: 'sin acceso' });
+  });
+
+  it('revalidates recovered connections and rejects revoked sessions', async () => {
+    const client = buildClient('old');
+    client.recovered = true;
+    client.data.user = sessionUser;
+    jwtService.verify.mockReturnValue({ sub: 'user-1', authVersion: 0 });
+    sessionService.validateTokenPayload.mockRejectedValue(new Error('revoked'));
+    await gateway.handleConnection(client as any);
+    expect(client.disconnect).toHaveBeenCalledWith(true);
+    expect(client.data.user).toBeUndefined();
+  });
+
+  it('detects a reset racing with the initial session-room join', async () => {
+    const client = buildClient('old');
+    jwtService.verify.mockReturnValue({ sub: 'user-1' });
+    sessionService.validateTokenPayload.mockResolvedValueOnce(sessionUser).mockRejectedValueOnce(new Error('revoked'));
+    await gateway.handleConnection(client as any);
+    expect(client.join).toHaveBeenCalledWith('session:user-1');
+    expect(client.disconnect).toHaveBeenCalledWith(true);
+  });
+
+  it('disconnects only sockets belonging to the recovered account and unsubscribes', () => {
+    const disconnectSockets = jest.fn();
+    const unsubscribe = jest.fn();
+    sessionService.onRevoked.mockReturnValue(unsubscribe);
+    gateway.server = { in: jest.fn().mockReturnValue({ disconnectSockets }) } as any;
+    gateway.onModuleInit();
+    sessionService.onRevoked.mock.calls[0][0]('user-2');
+    expect(gateway.server.in).toHaveBeenCalledWith('session:user-2');
+    expect(disconnectSockets).toHaveBeenCalledWith(true);
+    gateway.onModuleDestroy();
+    expect(unsubscribe).toHaveBeenCalled();
   });
 
   it('emits new chat messages only to the meeting room', () => {

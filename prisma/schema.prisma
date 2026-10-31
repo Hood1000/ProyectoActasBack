@@ -24,6 +24,7 @@ model User {
   sede         String?
   phoneNumber  String?
   password     String
+  authVersion  Int           @default(0)
   isActive     Boolean       @default(true)
   role         Role          @default(DOCENTE)
   dedicacion   Dedicacion?
@@ -40,6 +41,21 @@ model User {
   absenceAlerts AbsenceAlert[] @relation("TeacherAbsenceAlerts")
   reviewedAbsenceAlerts AbsenceAlert[] @relation("AbsenceAlertReviewer")
   notificationRecipients NotificationRecipient[]
+  passwordResetTokens PasswordResetToken[]
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
 }
 
 model Meeting {

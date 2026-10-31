@@ -1,14 +1,41 @@
-import { Controller, Post, Body, Request, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { Controller, Post, Body, Request, UnauthorizedException, UseGuards, HttpCode, ValidationPipe } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { Roles } from './roles.decorator';
 import { RolesGuard } from './roles.guard';
+import { PasswordRecoveryService } from './password-recovery.service';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { RecoveryRateLimitGuard } from './recovery-rate-limit.guard';
 
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private readonly passwordRecoveryService: PasswordRecoveryService,
+  ) {}
+
+  @Post('forgot-password')
+  @HttpCode(200)
+  @UseGuards(RecoveryRateLimitGuard)
+  forgotPassword(
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }))
+    body: ForgotPasswordDto,
+  ) {
+    return this.passwordRecoveryService.forgotPassword(body.email);
+  }
+
+  @Post('reset-password')
+  @HttpCode(200)
+  @UseGuards(RecoveryRateLimitGuard)
+  resetPassword(
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }))
+    body: ResetPasswordDto,
+  ) {
+    return this.passwordRecoveryService.resetPassword(body.token, body.password);
+  }
 
   @Post('login')
   async login(@Body() body: { email: string; password: string }) {

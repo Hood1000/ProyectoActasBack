@@ -25,6 +25,162 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Recuperacion de contrasena local (Windows, sin Docker)
+
+El usuario inicia el flujo desde **Olvide mi contrasena** en el login. Se envia
+unicamente a su correo registrado un enlace privado, de un solo uso, que vence
+en 30 minutos. No hay correos, copias ni aprobaciones del administrador.
+Solicitar el enlace no cambia la clave; confirmarla invalida las sesiones
+anteriores de esa cuenta, incluidas las conexiones del chat.
+
+### Mailpit
+
+Usar el ejecutable Windows de una [release oficial de Mailpit](https://github.com/axllent/mailpit/releases)
+y verificar el SHA-256 publicado antes de extraerlo. La instalacion local actual
+esta en `%LOCALAPPDATA%\ActasTools\mailpit\v1.32.0`.
+
+```powershell
+& "$env:LOCALAPPDATA\ActasTools\mailpit\v1.32.0\mailpit.exe" --smtp 127.0.0.1:1025 --listen 127.0.0.1:8025
+```
+
+No iniciar una segunda instancia si el panel ya esta disponible. Usar Ctrl+C
+para detener la instancia iniciada en la terminal. No configurar relay ni
+forwarding y no exponer los puertos a la red.
+
+El panel esta en http://127.0.0.1:8025. **Mailpit captura los mensajes localmente;
+no los entrega a Gmail, Outlook ni otras bandejas reales.** No necesita cuenta
+ni servicio de pago. Quien tenga acceso al panel puede leer los enlaces de
+prueba; usar cuentas de demostracion y no datos reales.
+
+Configurar en `.env`, conservando las demas variables:
+
+```dotenv
+MAIL_TRANSPORT=smtp
+SMTP_HOST=127.0.0.1
+SMTP_PORT=1025
+SMTP_USER=
+SMTP_PASS=
+SMTP_FROM="Sistema de Actas <no-reply@actas.test>"
+FRONTEND_URL=http://localhost:5174
+```
+
+Las credenciales SMTP son opcionales, pero si se usa autenticacion deben estar
+ambas presentes. `FRONTEND_URL` debe coincidir con el origen real de Vite,
+sin credenciales, query ni fragmento. Incluir ese origen en `CORS_ORIGINS`.
+El enlace usa un fragmento que no se envia al servidor web; la pantalla lo
+retira de la barra y lo mantiene solo en memoria. Tras recargar esa pantalla,
+reabrir el enlace original del correo. No se envian tokens en logs o respuestas.
+
+### Gmail API: entrega real por HTTPS
+
+Cuando la red bloquea los puertos SMTP 465/587, `MAIL_TRANSPORT=gmail-api`
+envia mediante HTTPS (443). La cuenta Gmail autorizada es el remitente;
+la recuperacion sigue dirigida unicamente al correo registrado del usuario,
+sin copias ni aprobacion del administrador. Este transporte tambien se aplica
+a los correos existentes de reuniones y alertas, conservando sus destinatarios.
+
+Gmail API requiere **OAuth de usuario**: la contrasena de aplicacion SMTP y las
+cuentas de servicio de Cloud Storage no sirven para autorizar una cuenta Gmail
+personal. No compartir credenciales, codigos ni tokens por chat o capturas.
+
+1. Crear o seleccionar un proyecto en [Google Cloud Console](https://console.cloud.google.com/)
+  y habilitar **Gmail API** en la biblioteca de APIs.
+2. Configurar Google Auth Platform (marca y audiencia externa). Durante pruebas,
+  agregar como usuario de prueba solamente la cuenta Gmail que enviara los correos.
+3. Crear un cliente OAuth de tipo **Aplicacion de escritorio** y descargar su JSON
+  fuera del repositorio. No usar el JSON de una cuenta de servicio.
+4. Autorizar esa cuenta con el [flujo oficial de escritorio](https://developers.google.com/identity/protocols/oauth2/native-app):
+  navegador del sistema, callback local de loopback, PKCE y validacion de `state`.
+  Solicitar solo `https://www.googleapis.com/auth/gmail.send`, acceso offline y
+  consentimiento para obtener un refresh token. No solicitar lectura del correo.
+5. Introducir los valores en el `.env` local ignorado por Git, sin publicarlos.
+  `GMAIL_FROM` debe ser la cuenta autorizada o un alias de envio verificado en Gmail.
+  Cambiar `MAIL_TRANSPORT` solo cuando todos los valores esten disponibles:
+
+```dotenv
+MAIL_TRANSPORT=gmail-api
+GMAIL_CLIENT_ID=<id-del-cliente-oauth>
+GMAIL_CLIENT_SECRET=<secreto-del-cliente-oauth>
+GMAIL_REFRESH_TOKEN=<refresh-token-obtenido-con-consentimiento>
+GMAIL_FROM="Sistema de Actas <cuenta-remitente@gmail.com>"
+```
+
+Recompilar y reiniciar el backend para aplicar los cambios. La biblioteca oficial
+renueva el access token automaticamente. No se reintenta automaticamente el envio
+ante fallos de red ni se cambia a SMTP, para evitar envios duplicados. Los errores
+de OAuth/API no exponen credenciales ni el contenido del mensaje. Si falla la
+recuperacion, se conserva la clave y se revoca el enlace recien emitido.
+
+**Limites:** Gmail API se puede usar sin contratar Workspace, sujeto a cuotas,
+limites de la cuenta y controles antispam; una respuesta de envio no garantiza
+que el mensaje llegue a la bandeja principal. En modo externo **Testing**, el
+refresh token con permiso Gmail vence a los **7 dias**. Para uso continuo revisar
+la publicacion y los requisitos de verificacion de Google; no asumir autorizacion
+permanente. Una revocacion, cambio de clave de Gmail u otras politicas tambien
+pueden exigir volver a autorizar. No eliminar la configuracion SMTP: para volver
+a Mailpit, seleccionar `MAIL_TRANSPORT=smtp` y sus valores locales.
+
+`FRONTEND_URL` debe apuntar al frontend real. Un enlace con `localhost` solo sirve
+en el equipo donde se ejecuta la aplicacion; otros equipos requieren una URL
+accesible y HTTPS en produccion. Las pruebas unitarias simulan Gmail API; la
+entrega real debe verificarse tras autorizar la cuenta, sin cambiar claves reales
+como parte de una prueba automatizada.
+
+### Base de datos y arranque
+
+Antes de agregar estructuras, crear y verificar un respaldo con `pg_dump`
+en formato custom y `pg_restore --list`. Conservarlo fuera del repositorio.
+El schema incorpora `PasswordResetToken` y `User.authVersion`. Aplicar solamente
+el SQL aditivo e idempotente de esta funcionalidad; no usar `prisma migrate`,
+`db push` ni `reset` por el historial divergente de esta base:
+
+```powershell
+npx prisma db execute --file scripts/add-password-recovery.sql
+npm run build
+```
+
+Si 5000 y 5173 estan ocupados, usar dos terminales sin detener sus procesos.
+Desde `Back/`:
+
+```powershell
+$env:PORT="5001"
+npm run start:prod
+```
+
+Desde `front/`:
+
+```powershell
+$env:VITE_API_URL="http://localhost:5001"
+npm run dev -- --host localhost --port 5174 --strictPort
+```
+
+Abrir http://localhost:5174, solicitar el enlace con una cuenta de prueba,
+inspeccionar su HTML, texto y destinatario en Mailpit, y confirmar una clave
+nueva. La clave anterior debe dejar de funcionar y reutilizar el enlace debe
+fallar. Comprobar tambien que una cuenta inexistente recibe la misma respuesta
+generica y que no existe mensaje administrativo.
+
+### Pruebas y limites
+
+```powershell
+npx jest src/auth/password-recovery.service.spec.ts src/auth/session.service.spec.ts src/auth/recovery-rate-limit.guard.spec.ts src/mail/mail.service.spec.ts src/meeting/meeting-chat.gateway.spec.ts --runInBand
+```
+
+El token se almacena como SHA-256; la clave usa bcrypt. Se admiten al menos
+6 caracteres y hasta 72 bytes UTF-8. El consumo es transaccional con reintentos
+de conflictos de serializacion y revoca los otros enlaces del mismo usuario.
+Se limita la emision a una por minuto por cuenta y los intentos a 20 por IP
+y 5 por correo/token en 15 minutos. El limitador de intentos y los eventos de
+desconexion son locales a una sola instancia; varias instancias requieren
+almacenamiento/eventos compartidos. Las respuestas no revelan si el correo
+existe; el tiempo de respuesta puede depender del proveedor porque el envio es
+sincrono. Una entrega productiva requiere cola de correo, un transporte real
+(SMTP con TLS o Gmail API) y HTTPS; Mailpit no sustituye un proveedor de entrega.
+
+No hay fallback que muestre contrasenas o enlaces si el correo falla. La clave
+actual se conserva y el token del envio fallido se revoca. El usuario puede
+volver a solicitarlo respetando los limites. Un nuevo enlace invalida el anterior.
+
 ## Project setup
 
 ```bash

@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import {
   ConnectedSocket,
@@ -10,8 +10,9 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { MeetingService } from './meeting.service';
+import { SessionService, type SessionPayload } from '../auth/session.service';
 
-type SocketUser = { id: string; email: string; role: string };
+type SocketUser = { id: string; email: string; role: string; authVersion: number };
 
 const meetingRoom = (meetingId: string) => `meeting:${meetingId}`;
 
@@ -32,26 +33,39 @@ const corsOrigin = (origin: string | undefined, callback: (err: Error | null, al
   cors: { origin: corsOrigin, credentials: true },
   connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 },
 })
-export class MeetingChatGateway implements OnGatewayConnection {
+export class MeetingChatGateway implements OnGatewayConnection, OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MeetingChatGateway.name);
+  private unsubscribeRevocation?: () => void;
 
   @WebSocketServer()
-  server: Server;
+  server!: Server;
 
   constructor(
     private readonly jwtService: JwtService,
     private readonly meetingService: MeetingService,
+    private readonly sessionService: SessionService,
   ) {}
 
-  handleConnection(client: Socket) {
-    // Sesion recuperada por connectionStateRecovery: conserva data y salas.
-    if (client.recovered && client.data.user) return;
+  onModuleInit() {
+    this.unsubscribeRevocation = this.sessionService.onRevoked((userId) => {
+      this.server?.in(`session:${userId}`).disconnectSockets(true);
+    });
+  }
 
+  onModuleDestroy() {
+    this.unsubscribeRevocation?.();
+  }
+
+  async handleConnection(client: Socket) {
     const token = client.handshake.auth?.token;
     try {
-      const payload = this.jwtService.verify<{ sub: string; email: string; role: string }>(token);
-      client.data.user = { id: payload.sub, email: payload.email, role: payload.role } satisfies SocketUser;
+      const payload = this.jwtService.verify<SessionPayload>(token);
+      const user = await this.sessionService.validateTokenPayload(payload);
+      client.data.user = user satisfies SocketUser;
+      await client.join(`session:${user.id}`);
+      await this.sessionService.validateTokenPayload(payload);
     } catch {
+      delete client.data.user;
       client.disconnect(true);
     }
   }
@@ -65,7 +79,8 @@ export class MeetingChatGateway implements OnGatewayConnection {
     }
 
     try {
-      await this.meetingService.ensureUserCanAccessMeetingChat(meetingId, user.id, user.role);
+      const current = await this.sessionService.validateTokenPayload({ sub: user.id, authVersion: user.authVersion });
+      await this.meetingService.ensureUserCanAccessMeetingChat(meetingId, current.id, current.role);
       await client.join(meetingRoom(meetingId));
       return { ok: true };
     } catch (error) {
