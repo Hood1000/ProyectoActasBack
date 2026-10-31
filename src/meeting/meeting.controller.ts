@@ -23,6 +23,7 @@ import { ReviewAbsenceAlertDto } from './dto/review-absence-alert.dto';
 import { VotePollDto } from './dto/vote-poll.dto';
 import { StorageService } from '../storage/storage.service';
 import { detectFileSignature } from '../storage/file-signature';
+import { MeetingAttendancePrivacyInterceptor } from './meeting-attendance.interceptor';
 
 const MAX_UPLOAD_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 15 * 1024 * 1024);
 const ALLOWED_EVIDENCE_MIME_TYPES = [
@@ -38,6 +39,7 @@ const EVIDENCE_FORMAT_ERROR = 'Solo se permiten archivos PDF, Word o imágenes (
 @ApiTags('meetings')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@UseInterceptors(MeetingAttendancePrivacyInterceptor)
 @Controller('meetings')
 export class MeetingController {
   constructor(

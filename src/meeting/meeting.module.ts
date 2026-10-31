@@ -7,11 +7,14 @@ import { RolesGuard } from '../auth/roles.guard';
 import { AuthModule } from '../auth/auth.module';
 import { MailModule } from '../mail/mail.module';
 import { SessionModule } from '../auth/session.module';
+import { AttendanceReportController } from './attendance-report.controller';
+import { AttendanceReportService } from './attendance-report.service';
+import { MeetingAttendancePrivacyInterceptor } from './meeting-attendance.interceptor';
 
 @Module({
   imports: [AuthModule, MailModule, SessionModule],
-  controllers: [MeetingController],
-  providers: [MeetingService, MeetingChatGateway, MeetingScheduler, RolesGuard],
+  controllers: [AttendanceReportController, MeetingController],
+  providers: [MeetingService, MeetingChatGateway, MeetingScheduler, RolesGuard, AttendanceReportService, MeetingAttendancePrivacyInterceptor],
   exports: [MeetingService],
 })
 export class MeetingModule implements OnModuleInit {

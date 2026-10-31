@@ -967,7 +967,6 @@ export class MeetingService {
   }
 
   async create(moderatorId: string, dto: CreateMeetingDto) {
-    const invitedUserIds = dto.invitedUserIds ?? [];
     const baseAgendaPoints = dto.baseAgendaPoints ?? [];
     const quorumMinimo = this.quorumMinimum(dto.meetingCategory);
     const date = new Date(dto.date);
@@ -975,7 +974,11 @@ export class MeetingService {
     this.ensureMeetingSchedule(date);
     const attendanceOpensAt = new Date(date.getTime() - this.attendanceOpenMinutesBefore * 60 * 1000);
 
-    const meeting = await prisma.meeting.create({
+    const meeting = await prisma.$transaction(async (tx) => {
+      const invitedUserIds = dto.invitedUserIds ?? (await tx.user.findMany({
+        where: { isActive: true }, select: { id: true },
+      })).map((registeredUser) => registeredUser.id);
+      return tx.meeting.create({
       data: {
         title: dto.title,
         description: dto.description,
@@ -997,6 +1000,7 @@ export class MeetingService {
         },
       },
       include: this.meetingInclude,
+      });
     });
 
     await this.sendMeetingEmailNotification(meeting, 'created');
@@ -1252,7 +1256,7 @@ export class MeetingService {
       where: { userId, meetingId: id },
       data: {
         status: dto.status,
-        excuse: dto.excuse,
+        excuse: dto.status === AttendanceStatus.JUSTIFICADA ? dto.excuse?.trim() || null : null,
         markedAt: new Date(),
       },
     });
@@ -1262,7 +1266,6 @@ export class MeetingService {
     }
 
     await this.refreshQuorum(id);
-    await this.triggerAbsenceThresholdAlerts(id);
     return this.findOne(id);
   }
 
@@ -1382,7 +1385,6 @@ export class MeetingService {
     }
 
     await this.refreshQuorum(id);
-    await this.triggerAbsenceThresholdAlerts(id);
     return this.findOne(id);
   }
 
@@ -2048,6 +2050,8 @@ export class MeetingService {
     if (!alert) {
       throw new NotFoundException('Alerta de inasistencia no encontrada');
     }
+
+    if (alert.issuedAt) throw new BadRequestException('Una amonestacion emitida no puede modificarse');
 
     const reviewedAt = new Date();
     const reviewNotes = dto.reviewNotes?.trim() || null;

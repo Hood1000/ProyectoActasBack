@@ -181,6 +181,67 @@ No hay fallback que muestre contrasenas o enlaces si el correo falla. La clave
 actual se conserva y el token del envio fallido se revoca. El usuario puede
 volver a solicitarlo respetando los limites. Un nuevo enlace invalida el anterior.
 
+## Historial de asistencia y amonestaciones
+
+En **Asistencia**, solo ADMIN puede abrir **Historial por docente**: resumen
+paginado, busqueda por nombre o cedula, filtros de ano/mes y detalle por reunion.
+Incluye docentes desactivados para conservar el historial. SECRETARIO mantiene
+el registro operativo por reunion, sin acceso al historial completo ni a sus
+porcentajes. DOCENTE no puede consultar registros de otros usuarios.
+
+Solo se cuentan filas de asistencia de usuarios DOCENTE en reuniones donde
+estaban convocados, con asistencia finalizada, no canceladas y no futuras.
+PENDIENTE no entra en el calculo. El porcentaje es presentes dividido entre
+presentes + ausentes + justificadas, por 100; una justificacion no cuenta como
+presencia. Sin registros evaluables se muestra **Sin datos**, no 0 %. Los
+limites mensuales usan America/Caracas, con inicio incluido y fin excluido.
+
+Al crear una reunion sin `invitedUserIds`, se convocan y guardan todos los
+usuarios activos (ADMIN, SECRETARIO y DOCENTE) dentro de la misma transaccion.
+Las estadisticas y el umbral de faltas siguen siendo exclusivos de DOCENTE.
+Una lista explicita, incluso vacia,
+se respeta. No se reconstruyen convocatorias antiguas, ni se crean faltas
+retroactivas para docentes nuevos o reuniones sin registros de asistencia.
+
+En **Inasistencias**, ADMIN y SECRETARIO consultan los casos con al menos
+**3 faltas injustificadas en el ano**, no en el mes. Una ausencia con texto
+de justificacion no sustenta una amonestacion. Consultar casos y registrar o
+finalizar asistencia no genera nuevas alertas, correos ni amonestaciones.
+Los correos y recordatorios normales de reuniones no cambian.
+
+Solo SECRETARIO puede **Emitir y guardar**, escribiendo el motivo y la accion
+realizada. El servidor revalida rol activo, umbral y duplicados dentro de una
+transaccion serializable. Se conserva un caso por docente/ano/umbral de 3;
+solicitudes simultaneas no crean dos documentos. La emision guarda fecha,
+responsable, contenido y una copia de las inasistencias y nombres de respaldo.
+Las correcciones posteriores actualizan las estadisticas, no esa evidencia.
+No se envia automaticamente por correo ni por notificacion. El docente ve
+solo sus documentos en **Mis amonestaciones**; pueden abrirse e imprimirse.
+
+Los endpoints de reportes y documentos son:
+
+- `GET /meetings/attendance/history` y `GET /meetings/attendance/history/:teacherId`: ADMIN.
+- `GET /meetings/absence-cases`: ADMIN y SECRETARIO.
+- `POST /meetings/absence-cases/:teacherId/warning`: SECRETARIO; cuerpo `{ "year": 2026, "content": "..." }`.
+- `GET /meetings/warnings` y `GET /meetings/warnings/:warningId`: personal autorizado; DOCENTE solo sus documentos.
+
+### Actualizacion aditiva y pruebas
+
+Antes de aplicar cambios, crear y verificar un respaldo custom con `pg_dump`
+y `pg_restore --list`, fuera del repositorio. La estructura reutiliza
+`AbsenceAlert` y agrega `issuedAt`, `issuedById` y `evidence`. Desde `Back/`,
+aplicar el SQL idempotente y recompilar, sin `prisma migrate`, `db push` ni reset:
+
+```powershell
+npx prisma db execute --file scripts/add-manual-warnings.sql
+npm run build
+npx jest src/meeting/attendance-report.service.spec.ts src/meeting/meeting.service.spec.ts --runInBand
+```
+
+Reiniciar la instancia del backend que usa el frontend para cargar el codigo
+compilado. Los reportes aceptan `page` (desde 1) y `limit` (1 a 100). Un filtro
+mensual requiere `year`; los casos y documentos se filtran por ano, no por mes.
+
 ## Project setup
 
 ```bash
