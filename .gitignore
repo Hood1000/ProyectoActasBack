@@ -66,3 +66,7 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # loose documents with real data
 *.pdf
 *.xlsx
+
+
+# package manager lock files
+package-lock.json
