@@ -4,6 +4,7 @@ import * as bcrypt from 'bcryptjs';
 import type { Prisma } from '../../generated/prisma';
 import prisma from '../prismaClient';
 import { MailService } from '../mail/mail.service';
+import { renderEmail } from '../mail/mail-template';
 import { SessionService } from './session.service';
 
 const recoveryMessage = 'Si existe una cuenta habilitada, recibir\u00e1s las instrucciones para recuperar tu contrase\u00f1a.';
@@ -86,15 +87,23 @@ export class PasswordRecoveryService {
         return { id: record.id, email: user.email };
       });
       if (!issued) return response;
-      const htmlUrl = url.replace(/[&<>"']/g, (character) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-      })[character]!);
+      const { html, text } = renderEmail({
+        preheader: 'Usa este enlace para crear una nueva contraseña. Vence en 30 minutos.',
+        eyebrow: 'Seguridad de la cuenta',
+        title: 'Restablece tu contraseña',
+        paragraphs: [
+          'Recibimos una solicitud para recuperar el acceso a tu cuenta del **Sistema de Actas**.',
+          'Pulsa el botón para crear una nueva contraseña:',
+        ],
+        action: { label: 'Establecer una nueva contraseña', url, showFallbackLink: true },
+        note: 'El enlace vence en **30 minutos** y solo puede usarse una vez. Si no lo solicitaste, ignora este correo: tu contraseña no cambiará hasta que confirmes una nueva.',
+      });
       try {
         await this.mailService.send({
           to: issued.email,
-          subject: 'Recuperacion de contrasena',
-          html: `<html lang="es"><body><h1>Restablecer contrase&ntilde;a</h1><p>Recibimos una solicitud para recuperar el acceso a tu cuenta del Sistema de Actas.</p><p><a href="${htmlUrl}">Establecer una nueva contrase&ntilde;a</a></p><p>El enlace vence en 30 minutos y solo puede usarse una vez.</p><p>Si no lo solicitaste, ignora este correo. Tu contrase&ntilde;a no cambiar&aacute; hasta que confirmes una nueva.</p></body></html>`,
-          text: `Para restablecer tu contrasena, abre el siguiente enlace:\n\n${url}\n\nEl enlace vence en 30 minutos y solo puede usarse una vez. Si no lo solicitaste, ignora este correo.`,
+          subject: 'Recuperación de contraseña - Sistema de Actas',
+          html,
+          text,
         });
       } catch {
         this.logger.warn('No se pudo enviar el correo de recuperacion.');

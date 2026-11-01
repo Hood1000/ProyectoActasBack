@@ -17,6 +17,7 @@ import { createHash } from 'crypto';
 import { gunzipSync, gzipSync } from 'zlib';
 import { join } from 'path';
 import { MailService } from '../mail/mail.service';
+import { appUrl, renderEmail } from '../mail/mail-template';
 import { CancelMeetingDto } from './dto/cancel-meeting.dto';
 import { CreateMeetingDto } from './dto/create-meeting.dto';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
@@ -192,33 +193,32 @@ export class MeetingService {
         ? `Nueva reunión programada: ${meeting.title}`
         : `Actualización de reunión: ${meeting.title}`;
 
-    const heading = type === 'created' ? 'Nueva reunión disponible' : 'Actualización de reunión';
-    const accent = type === 'created' ? '#1d4ed8' : '#0f766e';
-
-    const html = `
-      <div style="background:#f5f8ff;padding:24px;font-family:Arial,sans-serif;color:#172033;">
-        <div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #dbe4f4;border-radius:18px;overflow:hidden;">
-          <div style="padding:24px;background:linear-gradient(135deg, ${accent} 0%, #0f172a 100%);color:#ffffff;">
-            <h1 style="margin:0;font-size:26px;">${heading}</h1>
-            <p style="margin:8px 0 0;font-size:14px;opacity:.92;">Sistema institucional de reuniones UPT JFR</p>
-          </div>
-          <div style="padding:24px;">
-            <h2 style="margin:0 0 12px;font-size:22px;">${meeting.title}</h2>
-            <p style="margin:0 0 18px;line-height:1.6;color:#475569;">${meeting.description || 'Se registró una reunión en el sistema y ya puedes revisarla desde tu panel.'}</p>
-            <table style="width:100%;border-collapse:collapse;font-size:14px;">
-              <tr><td style="padding:10px;border:1px solid #e2e8f0;"><strong>Fecha</strong></td><td style="padding:10px;border:1px solid #e2e8f0;">${this.formatEmailDate(meeting.date)}</td></tr>
-              <tr><td style="padding:10px;border:1px solid #e2e8f0;"><strong>Lugar</strong></td><td style="padding:10px;border:1px solid #e2e8f0;">${meeting.location}</td></tr>
-              <tr><td style="padding:10px;border:1px solid #e2e8f0;"><strong>Modalidad</strong></td><td style="padding:10px;border:1px solid #e2e8f0;">${meeting.modality}</td></tr>
-              <tr><td style="padding:10px;border:1px solid #e2e8f0;"><strong>Organiza</strong></td><td style="padding:10px;border:1px solid #e2e8f0;">${meeting.organizer?.name || 'Coordinación'}</td></tr>
-            </table>
-            <p style="margin:18px 0 0;line-height:1.6;color:#334155;">Recuerda ingresar al sistema para revisar la convocatoria, los puntos asociados y confirmar asistencia cuando la ventana se abra.</p>
-          </div>
-        </div>
-      </div>`;
+    const modalities: Record<string, string> = { PRESENCIAL: 'Presencial', VIRTUAL: 'Virtual', HIBRIDA: 'Híbrida' };
+    const meetingsUrl = appUrl('/dashboard/reuniones');
+    const { html, text } = renderEmail({
+      preheader: `${meeting.title} - ${this.formatEmailDate(meeting.date)}`,
+      eyebrow: type === 'created' ? 'Nueva reunión' : 'Reunión actualizada',
+      title: meeting.title,
+      paragraphs: [
+        type === 'created'
+          ? 'Has sido convocado(a) a una nueva reunión registrada en el **Sistema de Actas**.'
+          : 'Se actualizaron los datos de una reunión a la que estás convocado(a). Revisa la información vigente:',
+        ...(meeting.description ? [meeting.description] : []),
+      ],
+      details: [
+        { label: 'Fecha y hora', value: this.formatEmailDate(meeting.date) },
+        { label: 'Lugar', value: meeting.location },
+        { label: 'Modalidad', value: modalities[meeting.modality] ?? meeting.modality },
+        { label: 'Organiza', value: meeting.organizer?.name || 'Coordinación' },
+      ],
+      ...(meetingsUrl ? { action: { label: 'Ver reunión en el sistema', url: meetingsUrl } } : {}),
+      note: 'Ingresa al sistema para revisar la convocatoria y los puntos del orden del día, y confirma tu asistencia cuando se habilite.',
+    });
 
     try {
       await this.mailService.send({
         html,
+        text,
         subject,
         to: recipients.map((recipient) => recipient.email).join(','),
       });
@@ -254,24 +254,29 @@ export class MeetingService {
     }
 
     const subject = `Alerta de inasistencias: ${payload.teacherName}`;
-    const html = `
-      <div style="background:#f5f8ff;padding:24px;font-family:Arial,sans-serif;color:#172033;">
-        <div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #dbe4f4;border-radius:18px;overflow:hidden;">
-          <div style="padding:24px;background:linear-gradient(135deg, #9f1239 0%, #0f172a 100%);color:#ffffff;">
-            <h1 style="margin:0;font-size:24px;">Alerta automática de inasistencia</h1>
-            <p style="margin:8px 0 0;font-size:14px;opacity:.92;">Control institucional de asistencia docente</p>
-          </div>
-          <div style="padding:24px;">
-            <p style="margin:0 0 12px;line-height:1.6;">El docente <strong>${payload.teacherName}</strong> acumula <strong>${payload.absencesCount} inasistencias injustificadas</strong> en el año ${payload.academicYear}.</p>
-            <p style="margin:0 0 12px;line-height:1.6;">Última reunión considerada: <strong>${payload.meetingTitle}</strong> (${this.formatEmailDate(payload.meetingDate)}).</p>
-            <p style="margin:0;line-height:1.6;color:#334155;">La amonestación o gestión disciplinaria se realiza por vía externa según protocolo institucional. Si existe justificativo médico o causa mayor, puede registrarse por secretaría.</p>
-          </div>
-        </div>
-      </div>`;
+    const sanctionsUrl = appUrl('/dashboard/sanctions');
+    const { html, text } = renderEmail({
+      tone: 'danger',
+      preheader: `${payload.teacherName} acumula ${payload.absencesCount} inasistencias injustificadas en ${payload.academicYear}.`,
+      eyebrow: 'Alerta de inasistencias',
+      title: `${payload.teacherName} acumula ${payload.absencesCount} inasistencias`,
+      paragraphs: [
+        `El docente **${payload.teacherName}** alcanzó **${payload.absencesCount} inasistencias injustificadas** en el año académico ${payload.academicYear}.`,
+      ],
+      details: [
+        { label: 'Docente', value: payload.teacherName },
+        { label: 'Inasistencias injustificadas', value: String(payload.absencesCount) },
+        { label: 'Año académico', value: String(payload.academicYear) },
+        { label: 'Última reunión considerada', value: `${payload.meetingTitle} (${this.formatEmailDate(payload.meetingDate)})` },
+      ],
+      ...(sanctionsUrl ? { action: { label: 'Revisar en el sistema', url: sanctionsUrl } } : {}),
+      note: 'La amonestación o gestión disciplinaria se realiza por vía externa según el protocolo institucional. Si existe justificativo médico o causa mayor, puede registrarse por secretaría.',
+    });
 
     try {
       await this.mailService.send({
         html,
+        text,
         subject,
         to: recipients.join(','),
       });

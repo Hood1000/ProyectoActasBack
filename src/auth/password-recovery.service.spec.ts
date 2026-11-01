@@ -115,7 +115,7 @@ describe('PasswordRecoveryService', () => {
     expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: 'Serializable' });
     const message = mail.send.mock.calls[0][0];
     expect(Object.keys(message).sort()).toEqual(['html', 'subject', 'text', 'to']);
-    expect(message.html).toContain('Establecer una nueva contrase&ntilde;a');
+    expect(message.html).toContain('Establecer una nueva contraseña');
     expect(message).not.toHaveProperty('cc');
     expect(message).not.toHaveProperty('bcc');
     expect(message.to).toBe(user.email);

@@ -3,6 +3,7 @@ import { OAuth2Client } from 'google-auth-library';
 import * as nodemailer from 'nodemailer';
 import type { SendMailOptions } from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
+import { inlineAttachmentsFor } from './mail-template';
 
 @Injectable()
 export class MailService {
@@ -14,7 +15,9 @@ export class MailService {
     return Boolean(process.env.SMTP_HOST && (process.env.SMTP_FROM || process.env.SMTP_USER));
   }
 
-  async send(options: SendMailOptions) {
+  async send(message: SendMailOptions) {
+    const inline = inlineAttachmentsFor(message.html);
+    const options = inline.length ? { ...message, attachments: [...(message.attachments ?? []), ...inline] } : message;
     if (process.env.MAIL_TRANSPORT === 'gmail-api') return this.sendWithGmail(options);
     if (process.env.MAIL_TRANSPORT && process.env.MAIL_TRANSPORT !== 'smtp') {
       throw new Error('Transporte de correo no reconocido');
