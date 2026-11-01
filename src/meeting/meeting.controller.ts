@@ -68,7 +68,7 @@ export class MeetingController {
     return this.meetingService.findAvailableAgendaForUser(req.user.id, req.user.role, meetingId);
   }
 
-  @Roles('ADMIN')
+  @Roles('ADMIN', 'SECRETARIO')
   @Get('annual-archives')
   listAnnualArchives() {
     return this.meetingService.listAnnualArchives();

@@ -89,7 +89,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return {
         statusCode,
         message: readableMessage,
-        errorCode: (asObject.error as string) || 'HTTP_EXCEPTION',
+        errorCode: (asObject.errorCode as string) || (asObject.error as string) || 'HTTP_EXCEPTION',
         details,
       };
     }

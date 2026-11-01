@@ -614,7 +614,11 @@ export class MeetingService {
     const year = date.getFullYear();
     const hasClosedYear = this.readAnnualArchiveIndex().some((entry) => entry.year === year);
     if (hasClosedYear) {
-      throw new ForbiddenException(`El año lectivo ${year} está cerrado y solo permite lectura`);
+      throw new ForbiddenException({
+        errorCode: 'ACADEMIC_YEAR_CLOSED',
+        message: `No se pueden crear ni modificar reuniones del año lectivo ${year}: ya se realizó el cierre anual y quedó en modo solo lectura.`,
+        year,
+      });
     }
   }
 
@@ -1152,6 +1156,7 @@ export class MeetingService {
 
     const nextDate = dto.date ? new Date(dto.date) : null;
     if (nextDate) {
+      this.ensureAcademicYearOpenByDate(nextDate);
       this.ensureMeetingSchedule(nextDate);
     }
     const nextAttendanceOpensAt = nextDate
