@@ -26,9 +26,11 @@ export function escapeHtml(value: string): string {
 }
 
 export async function renderHtmlToPdf(html: string): Promise<Buffer> {
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
   const browser = await puppeteer.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    executablePath,
   });
   try {
     const page = await browser.newPage();

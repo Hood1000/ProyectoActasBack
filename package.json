@@ -19,6 +19,7 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "db:migrate": "prisma migrate deploy",
+    "db:seed:admin": "ts-node src/scripts/seed-admin.ts",
     "db:seed": "ts-node src/scripts/seed-test-users.ts",
     "db:seed:demo": "ts-node src/scripts/seed-demo-data.ts",
     "db:setup": "npm run db:migrate && npm run db:seed",
