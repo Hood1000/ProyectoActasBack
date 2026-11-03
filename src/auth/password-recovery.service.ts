@@ -4,6 +4,7 @@ import * as bcrypt from 'bcryptjs';
 import type { Prisma } from '../../generated/prisma';
 import prisma from '../prismaClient';
 import { MailService } from '../mail/mail.service';
+import { describeMailError } from '../mail/mail-error';
 import { renderEmail } from '../mail/mail-template';
 import { SessionService } from './session.service';
 
@@ -86,6 +87,7 @@ export class PasswordRecoveryService {
         });
         return { id: record.id, email: user.email };
       });
+      if (!configured) this.logger.warn('Transporte de correo no configurado; no se envio la recuperacion.');
       if (!issued) return response;
       const { html, text } = renderEmail({
         preheader: 'Usa este enlace para crear una nueva contraseña. Vence en 30 minutos.',
@@ -105,15 +107,15 @@ export class PasswordRecoveryService {
           html,
           text,
         });
-      } catch {
-        this.logger.warn('No se pudo enviar el correo de recuperacion.');
+      } catch (error: unknown) {
+        this.logger.warn(`No se pudo enviar el correo de recuperacion: ${describeMailError(error)}.`);
         await prisma.passwordResetToken.updateMany({
           where: { id: issued.id, usedAt: null, revokedAt: null },
           data: { revokedAt: new Date() },
         });
       }
-    } catch {
-      this.logger.warn('No se pudo completar la solicitud de recuperacion.');
+    } catch (error: unknown) {
+      this.logger.warn(`No se pudo completar la solicitud de recuperacion: ${describeMailError(error)}.`);
     }
     return response;
   }

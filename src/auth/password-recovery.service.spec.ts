@@ -162,7 +162,7 @@ describe('PasswordRecoveryService', () => {
       where: { id: 'reset-id', usedAt: null, revokedAt: null },
       data: { revokedAt: expect.any(Date) },
     });
-    expect(warning).toHaveBeenCalledWith('No se pudo enviar el correo de recuperacion.');
+    expect(warning).toHaveBeenCalledWith('No se pudo enviar el correo de recuperacion: causa desconocida.');
     expect(JSON.stringify(warning.mock.calls)).not.toMatch(/Teacher|private|https/);
     await expect(service.forgotPassword(user.email)).resolves.toEqual(result);
     expect(mail.send).toHaveBeenCalledTimes(2);

@@ -73,8 +73,12 @@ export class MailService {
       });
       if (!response.data.id) throw new Error('Respuesta Gmail API incompleta');
       return { messageId: response.data.id };
-    } catch {
-      throw new Error('No se pudo enviar el correo mediante Gmail API');
+    } catch (error: unknown) {
+      const failure = new Error('No se pudo enviar el correo mediante Gmail API');
+      // Solo se conserva el estado HTTP (p. ej. 400 invalid_grant, 403 sin permiso) para diagnosticar sin exponer tokens.
+      const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
+      if (typeof status === 'number') Object.assign(failure, { responseCode: status });
+      throw failure;
     }
   }
 }
