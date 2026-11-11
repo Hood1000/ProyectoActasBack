@@ -9,6 +9,8 @@ jest.mock('../prismaClient', () => ({
   default: { attendance: { findMany: jest.fn(), updateMany: jest.fn() }, user: { findMany: jest.fn() }, meeting: { create: jest.fn() }, $transaction: jest.fn() },
 }));
 
+const mailStub = { isConfigured: jest.fn(), send: jest.fn() };
+
 describe('Meeting email notifications', () => {
   const mail = { isConfigured: jest.fn(), send: jest.fn() };
   const service = new MeetingService(mail as unknown as MailService);
@@ -107,5 +109,22 @@ describe('Meeting email notifications', () => {
     } finally {
       errorLog.mockRestore();
     }
+  });
+});
+
+describe('Lectura del acta anterior', () => {
+  const service = new MeetingService(mailStub as unknown as MailService);
+  const previousMinutePoint = { id: 'base', title: 'Lectura del acta anterior', isBasePoint: true };
+  const ownPoint = { id: 'own', title: 'Presupuesto del trimestre', isBasePoint: true };
+  const meeting = { agendaPoints: [previousMinutePoint, ownPoint] };
+
+  it('hides the point when the previous meeting left nothing to resume', () => {
+    expect(service['hideEmptyPreviousMinutePoint'](meeting, null).agendaPoints).toEqual([ownPoint]);
+    expect(service['hideEmptyPreviousMinutePoint'](meeting, { points: [] }).agendaPoints).toEqual([ownPoint]);
+  });
+
+  it('keeps the point when pending or deferred points carry over', () => {
+    const carried = { points: [{ title: 'Punto diferido', description: 'Sin votar' }] };
+    expect(service['hideEmptyPreviousMinutePoint'](meeting, carried).agendaPoints).toEqual(meeting.agendaPoints);
   });
 });

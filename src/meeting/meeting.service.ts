@@ -504,6 +504,21 @@ export class MeetingService {
     );
   }
 
+  // La lectura del acta anterior solo tiene sentido cuando hay algo que retomar: si la reunion
+  // previa no dejo puntos pendientes ni diferidos, se oculta para no confundir al usuario.
+  private hideEmptyPreviousMinutePoint<
+    T extends { agendaPoints: { title: string; isBasePoint: boolean }[] },
+  >(meeting: T, previousMinute: { points: unknown[] } | null): T {
+    if (previousMinute && previousMinute.points.length > 0) {
+      return meeting;
+    }
+
+    return {
+      ...meeting,
+      agendaPoints: meeting.agendaPoints.filter((point) => !this.isPreviousMinutePoint(point)),
+    };
+  }
+
   private mapMeetingView<
     T extends {
       hasQuorum: boolean;
@@ -1026,10 +1041,13 @@ export class MeetingService {
       orderBy: { date: 'desc' },
     });
 
-    return meetings.map((meeting) => ({
-      ...this.mapMeetingView(meeting),
-      previousMinute: this.previousMinuteFrom(this.findPreviousClosedMeeting(meeting, meetings)),
-    }));
+    return meetings.map((meeting) => {
+      const previousMinute = this.previousMinuteFrom(this.findPreviousClosedMeeting(meeting, meetings));
+      return {
+        ...this.hideEmptyPreviousMinutePoint(this.mapMeetingView(meeting), previousMinute),
+        previousMinute,
+      };
+    });
   }
 
   async findOne(id: string) {
@@ -1053,9 +1071,11 @@ export class MeetingService {
       include: { agendaPoints: true },
     });
 
+    const previousMinute = this.previousMinuteFrom(previous);
+
     return {
-      ...this.mapMeetingView(meeting),
-      previousMinute: this.previousMinuteFrom(previous),
+      ...this.hideEmptyPreviousMinutePoint(this.mapMeetingView(meeting), previousMinute),
+      previousMinute,
     };
   }
 
